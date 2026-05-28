@@ -63,11 +63,11 @@ EXTRACT_FLAGS.extend(["--isosurface_value", str(ext_args.isosurface_value)])
 
 shared_args, known = parse_data_args(train_args)
 
-print("[INFO] Step 1/3: Training...")
-result = subprocess.run([sys.executable, TRAIN_SCRIPT] + TRAIN_FLAGS + train_args)
-if result.returncode != 0:
-    print("[ERROR] Training failed. Aborting extraction.")
-    sys.exit(result.returncode)
+#print("[INFO] Step 1/3: Training...")
+#result = subprocess.run([sys.executable, TRAIN_SCRIPT] + TRAIN_FLAGS + train_args)
+#if result.returncode != 0:
+#    print("[ERROR] Training failed. Aborting extraction.")#
+#    sys.exit(result.returncode)
 
 print("[INFO] Step 2/3: Extracting mesh...")
 result = subprocess.run([sys.executable, EXTRACT_SCRIPT] + EXTRACT_FLAGS + shared_args)

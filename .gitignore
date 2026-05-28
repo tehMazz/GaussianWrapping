@@ -20,6 +20,8 @@ train_test_depth.py
 *.out
 
 log/
+logs/
+logs
 profiler_test.py
 
 #####################

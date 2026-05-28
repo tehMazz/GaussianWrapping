@@ -14,9 +14,14 @@ scenes = [
     "kitchen",
     "room",
     "stump",
-    "flowers",
-    "treehill",
 ]
+
+# Predefined 3-way split for parallel SLURM submission (3-2-2).
+SCENE_GROUPS = {
+    0: ["bicycle", "bonsai", "counter"],
+    1: ["garden", "kitchen"],
+    2: ["room", "stump"],
+}
 
 
 if __name__ == "__main__":
@@ -41,11 +46,25 @@ if __name__ == "__main__":
                         help="Apply Blender decimation before texturing. NOTE: This willl not affect the mesh used for metric computation. This flag only outputs an additional decimated mesh.")
     parser.add_argument("--decimate_ratio", type=float, default=0.3,
                         help="Decimation ratio for Blender.")
+    parser.add_argument("--scenes_id", type=int, default=None, choices=sorted(SCENE_GROUPS.keys()),
+                        help="Run only the subset of scenes from the predefined 3-way split "
+                             "(0/1/2). If omitted, runs all scenes.")
+    parser.add_argument("--scenes", type=str, default=None,
+                        help="Comma-separated explicit scene list (overrides --scenes_id).")
     args = parser.parse_args()
 
     data_device = "cuda" if args.data_on_gpu else "cpu"
 
-    for scene_name in scenes:
+    if args.scenes:
+        scene_subset = [s.strip() for s in args.scenes.split(",") if s.strip()]
+    elif args.scenes_id is not None:
+        scene_subset = SCENE_GROUPS[args.scenes_id]
+    else:
+        scene_subset = scenes
+
+    print(f"[INFO] Running {len(scene_subset)} scene(s): {scene_subset}")
+
+    for scene_name in scene_subset:
         print(f"\n[INFO] ===== {scene_name} =====")
 
         scene_data_dir = os.path.join(args.data_dir, scene_name)
@@ -57,6 +76,7 @@ if __name__ == "__main__":
         train_extract_command = " ".join(filter(None, [
             f"CUDA_VISIBLE_DEVICES={args.gpu_device}",
             "python gaussian_wrapping/scripts/train_and_extract_gw_radegs.py",
+            "--eval",
             f"-s {scene_data_dir}",
             f"-m {scene_output_dir}",
             f"--data_device {data_device}",
