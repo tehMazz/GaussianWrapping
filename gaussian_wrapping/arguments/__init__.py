@@ -52,7 +52,7 @@ class ModelParams(ParamGroup):
         self._images = "images"
         self._resolution = -1
         self._white_background = False
-        self.data_device = "cuda"
+        self.data_device = "cpu"  # images stay on the CPU (BakerH: up to 923 photos at 1600 px)
         self.eval = False
         # self.use_decoupled_appearance = False
         self.llff = 8
@@ -93,6 +93,20 @@ class OptimizationParams(ParamGroup):
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0002
+        # --- gs-atoms (B4/B6/B7/B8): every default reproduces today's behaviour exactly ---
+        self.optimizer_type = "sparse_adam"   # sparse_adam (stock) | view_adam | row_adam
+        self.view_norm = "max"                # ViewAdam per-row reference: mean | geo | max
+        self.gate_threshold = 0.0             # contrib gate; 0 = "any blended pixel", the validated arm
+        self.opacity_reset = True             # False: no reset (use opa_decay instead)
+        self.opa_decay = 1.0                  # <1 applies gated opacity decay each step while densifying
+        self.prune_contrib = False            # EpochPrune on blend mass
+        self.contrib_min = 0.01
+        self.prune_untouched = True           # also prune rows no view gated in a whole epoch
+        self.epoch_prune_until_iter = -1      # -1 = follow densify_until_iter
+        self.budget_cap = 0                   # 0 = off; else hard Gaussian budget with a sqrt ramp
+        self.budget_warmup_offset = 500
+        self.lambda_alpha = 0.0               # scene rendered-alpha -> 1 (B9)
+        self.alpha_floor = 0.05
         self.random_background = False
         self.appearance_embeddings_lr = 0.001
         self.appearance_network_lr = 0.001
@@ -122,7 +136,7 @@ def get_combined_args(parser : ArgumentParser):
 
     merged_dict = vars(args_cfgfile).copy()
     for k,v in vars(args_cmdline).items():
-        if v != None:
+        if v != None or k not in merged_dict:  # keep unset optional flags (None) that cfg_args lacks
             merged_dict[k] = v
     return Namespace(**merged_dict)
 

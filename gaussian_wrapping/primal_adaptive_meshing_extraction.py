@@ -249,7 +249,7 @@ def create_global_occupancy_func(args: ArgumentParser, return_details=False):
     
     if return_details: 
         ret_pckg = {"scene_radius": get_cameras_spatial_extent(cameras=views)['radius'].item(),
-                    "cameras": views}
+                    "cameras": views, "gaussians_xyz": gaussians.get_xyz.detach()}
         return global_occupancy_func, grad_occupancy_func, ret_pckg
     return global_occupancy_func, grad_occupancy_func
 
@@ -459,6 +459,15 @@ def load_mesh(args: ArgumentParser, scene_pckg: Dict[str, Any]):
         # Create an identity transform (4x4 matrix)
         transform = np.identity(4)
 
+    elif args.bounding_box_method == "gaussians":
+        # Robust AABB of the Gaussian centres (1st-99th percentile, padded), scaled about its centre.
+        # The "scene" cube is centred at the world origin, which misses forward-facing (LLFF) content.
+        from hollow.free_space import scene_bounds
+        lo, hi = (b.cpu().numpy().astype(np.float64) for b in scene_bounds(scene_pckg["gaussians_xyz"], pad=0.1))
+        centre, half = (lo + hi) / 2, (hi - lo) / 2 * args.bounding_box_scaling
+        crop_volume = o3d.geometry.AxisAlignedBoundingBox(centre - half, centre + half)
+        transform = np.identity(4)
+
     elif args.bounding_box_method == "blender":
         assert args.bounding_box_file is not None, \
             "--bounding_box_file is required when --bounding_box_method=blender"
@@ -502,8 +511,8 @@ def load_mesh(args: ArgumentParser, scene_pckg: Dict[str, Any]):
         mesh_cropped.remove_unreferenced_vertices()
     
     if len(mesh_cropped.vertices) == 0:
-        print("[WARNING] Cropped mesh is empty!")
-        return np.zeros((0, 3)), np.zeros((0, 3)), np.zeros((0, 3))
+        raise RuntimeError(f"Cropped mesh is empty with --bounding_box_method {args.bounding_box_method}; "
+                           "for forward-facing scenes use --bounding_box_method gaussians.")
 
     mesh = Meshes(verts=torch.as_tensor(np.asarray(mesh_cropped.vertices), dtype=torch.float32).to(device="cuda"), 
                   faces=torch.as_tensor(np.asarray(mesh_cropped.triangles), dtype=torch.int32).to(device="cuda"))
@@ -604,7 +613,7 @@ if __name__ == "__main__":
     parser.add_argument("--vacancy_threshold", default=0.1, type=float, help="Vacancy threshold for filtering")
     parser.add_argument("--save_candidate_points", action="store_true", help="Save candidate points to ply file")
     parser.add_argument("--post_process", action="store_true", help="Post process mesh")
-    parser.add_argument("--bounding_box_method", default="scene", type=str, choices=["ground_truth", "scene", "blender"])
+    parser.add_argument("--bounding_box_method", default="scene", type=str, choices=["ground_truth", "scene", "gaussians", "blender"])
     parser.add_argument("--bounding_box_scaling", default=1.0, type=float)
     parser.add_argument("--bounding_box_file", default=None, type=str,
                         help="Path to bounding volume JSON exported from the GW Blender add-on (required for --bounding_box_method=blender)")

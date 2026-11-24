@@ -10,3 +10,6 @@
 [submodule "submodules/Geometry-Grounded-Gaussian-Splatting"]
 	path = submodules/Geometry-Grounded-Gaussian-Splatting
 	url = https://github.com/HKUST-SAIL/Geometry-Grounded-Gaussian-Splatting.git
+[submodule "submodules/artifixer_gs"]
+	path = submodules/artifixer_gs
+	url = https://github.com/IVIazz97/Artifixers-3DGS.git

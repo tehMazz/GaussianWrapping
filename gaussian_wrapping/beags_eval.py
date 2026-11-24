@@ -1,0 +1,68 @@
+"""BEA-GS evaluation: segmentation metrics against GT masks, optional per-object renders.
+
+    python gaussian_wrapping/beags_eval.py -m <model> --gt_masks <dir> --masks <SAM2 dir> [--iteration N] [--render]
+
+Writes <model>/beags/metrics_<it>.json (IoU, BIoU, EIoU, BEIoU per split).
+--render saves, for views with GT: extracted_<label>/ (object alone, white bg) and removal_<label>/.
+Photometric metrics: use the stock `render.py --rasterizer ours` + `metrics.py` on the same iteration.
+"""
+import json
+import os
+import sys
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.abspath(os.path.join(BASE_DIR, '..'))
+sys.path.insert(0, BASE_DIR)
+sys.path.append(ROOT_DIR)
+sys.path.append(os.path.join(ROOT_DIR, 'submodules'))
+
+import torch
+import torchvision
+
+from beags.common import beags_path, load_model, parse_args
+from beags.masks import attach_gt_masks
+from beags.metrics import match_gt_to_labels, segmentation_metrics
+from gaussian_renderer.beags_api import render_labels
+
+
+def add_args(parser):
+    parser.add_argument("--gt_masks", required=True)
+    parser.add_argument("--masks", required=True, help="SAM2 input masks, used only to match GT ids to label ids")
+    parser.add_argument("--render", action="store_true")
+
+
+@torch.no_grad()
+def render_objects(cameras, gaussians, pipe, out_dir):
+    white = torch.ones(3, device="cuda")
+    for label in range(1, int(gaussians.labels.max()) + 1):
+        for name, mask in (("extracted", gaussians.labels == label), ("removal", gaussians.labels != label)):
+            folder = os.path.join(out_dir, f"{name}_{label}")
+            os.makedirs(folder, exist_ok=True)
+            for cam in cameras:
+                img = render_labels(cam, gaussians, pipe, white, mask=mask)["render"].clamp(0, 1)
+                torchvision.utils.save_image(img, os.path.join(folder, f"{cam.image_name}.png"))
+
+
+def main():
+    dataset, pipe, opt, args = parse_args("BEA-GS eval", add_args)
+    scene, gaussians = load_model(dataset, args.iteration, with_labels=True)
+    results = {}
+    for split, cams in (("test", scene.getTestCameras()), ("train", scene.getTrainCameras())):
+        attach_gt_masks(cams, args.gt_masks)
+        cams = [c for c in cams if c.gt is not None]
+        if not cams:
+            continue
+        gt_to_label = match_gt_to_labels(cams, args.masks)  # objects without Gaussians still count (IoU 0)
+        results[split] = segmentation_metrics(cams, gaussians, pipe, gaussians.labels, gt_to_label)
+        results[split]["gt_to_label"] = gt_to_label
+        summary = {k: v for k, v in results[split].items() if k not in ("per_view", "gt_to_label")}
+        print(f"[beags] {split} GT id -> label id: {gt_to_label}")
+        print(f"[beags] {split} ({len(cams)} GT views): {summary}")
+        if args.render:
+            render_objects(cams, gaussians, pipe, beags_path(dataset.model_path, f"renders_{scene.loaded_iter}"))
+    with open(beags_path(dataset.model_path, f"metrics_{scene.loaded_iter}.json"), "w") as f:
+        json.dump(results, f, indent=2)
+
+
+if __name__ == "__main__":
+    main()

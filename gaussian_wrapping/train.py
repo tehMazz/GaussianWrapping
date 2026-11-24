@@ -31,7 +31,13 @@ except ImportError:
 
 import numpy as np
 import time
+import json
 
+from lpipsPyTorch import lpips
+import robust
+from robust.bilagrid import BilateralGridModule
+from robust.losses import appearance_photometric_loss, load_ignore_mask, render_confidence, variance_losses
+from hollow.schedule import HollowSchedule
 from utils.geometry_utils import depth_to_normal, depth_to_normal_with_mask
 from utils.log_utils import log_normal_field_training_progress
 from regularization.regularizer.normal_field import (
@@ -56,6 +62,36 @@ from regularization.regularizer.mesh_in_the_loop import (
 )
 
 
+def read_lpips_images(path):
+    """Image names (with or without extension) whose loss is LPIPS only, e.g. ArtiFixer3D's generated frames."""
+    if not path:
+        return set()
+    with open(path) as f:
+        return {os.path.basename(line.strip()).split(".")[0] for line in f if line.strip()}
+
+
+def resolve_appearance(args):
+    """
+    Maps --appearance and GW's legacy --exposure_compensation / --decoupled_appearance onto one mode.
+    Without --appearance, the legacy flags decide (GW default: exposure compensation).
+    With --appearance, the legacy flags must agree with it.
+    """
+    if args.exposure_compensation and args.decoupled_appearance:
+        raise ValueError("Exposure compensation and appearance network cannot be used together")
+    legacy = "exposure" if args.exposure_compensation else ("network" if args.decoupled_appearance else None)
+    if args.appearance is None:
+        if args.exposure_compensation is None and not args.decoupled_appearance:
+            legacy = "exposure"
+        args.appearance = legacy or "none"
+    elif legacy not in (None, args.appearance):
+        raise ValueError(
+            f"--appearance {args.appearance} conflicts with --exposure_compensation / --decoupled_appearance "
+            f"(pass --no-exposure_compensation)"
+        )
+    args.exposure_compensation = args.appearance == "exposure"
+    args.decoupled_appearance = args.appearance == "network"
+
+
 def training(
     dataset, opt, pipe, 
     testing_iterations, saving_iterations, 
@@ -64,9 +100,10 @@ def training(
     depth_order_config, normal_field_config, multiview_config, milo_config,
     log_interval,
 ):
-    # ---Prepare logger--- 
+    # ---Prepare logger---
     run = prepare_output_and_logger(dataset, args)
-    
+    time_start = time.time()
+
     # ---Initialize scene and Gaussians---
     first_iter = 0
     use_mip_filter = not args.disable_mip_filter
@@ -120,7 +157,44 @@ def training(
         if args.multiview:
             if first_iter > multiview_config["start_multiview"]:
                 multiview_config["start_multiview"] = first_iter + 1
-    
+
+    # ---Robustness to non-clean data (robust/)---
+    if args.confidence:
+        print(f"[INFO] Using per-Gaussian confidence from iteration {args.conf_from_iter}.")
+        gaussians.enable_confidence()
+    bilagrid = None
+    if args.appearance.startswith("bilagrid"):
+        n_cameras = len(scene.getTrainCameras())
+        print(f"[INFO] Using {args.appearance} appearance for {n_cameras} cameras.")
+        bilagrid = BilateralGridModule(
+            num_views=n_cameras, total_iterations=opt.iterations, tv_weight=args.bilagrid_tv_weight,
+            identity_weight=args.bilagrid_identity_weight, mean_weight=args.bilagrid_mean_weight,
+            until=args.bilagrid_until,
+        )
+        print(f"[INFO] Bilateral grid: {robust.bilagrid_config(args)}.")
+        bilagrid_checkpoint = checkpoint and os.path.join(
+            os.path.dirname(checkpoint), os.path.basename(checkpoint).replace("chkpnt", "bilagrid")
+        )
+        if bilagrid_checkpoint and os.path.exists(bilagrid_checkpoint):
+            bilagrid.load_state_dict(torch.load(bilagrid_checkpoint))
+    use_robust_loss = (bilagrid is not None) or args.confidence or bool(args.ignore_masks)
+    if use_robust_loss and gaussians.use_appearance_network:
+        raise ValueError("--confidence / --ignore_masks are not supported with the appearance network")
+    use_variance_losses = (args.lambda_color_var > 0) or (args.lambda_normal_var > 0)
+
+    # ---Labels (BEA-GS), carried through densification and pruning---
+    if args.labels:
+        gaussians.labels = torch.load(args.labels, map_location="cuda")
+        print(f"[INFO] Loaded {gaussians.labels.shape[0]} labels from {args.labels}.")
+
+    # ---ArtiFixer3D distillation: generated frames are supervised by LPIPS only---
+    lpips_names = read_lpips_images(args.lpips_images)
+    if lpips_names:
+        train_names = {cam.image_name for cam in scene.getTrainCameras()}
+        missing = lpips_names - train_names
+        assert not missing, f"--lpips_images names not in the training cameras: {sorted(missing)[:10]}"
+        print(f"[INFO] LPIPS-only supervision on {len(lpips_names)} of {len(train_names)} training images.")
+
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
@@ -131,6 +205,32 @@ def training(
     # Initialize 3D Mip filter
     if use_mip_filter:
         gaussians.compute_3D_filter(cameras=scene.getTrainCameras().copy())
+
+    # ---Hollowing (hollow/): no geometry in unseen, free or see-through space---
+    hollow = HollowSchedule(args, scene, gaussians, pipe)
+    if hollow.enabled:
+        print(f"[INFO] Using hollowing from iteration {args.hollow_from}.")
+
+    # ---gs-atoms (B3/B6/B7): the gate, the gated opacity decay and the per-epoch contribution prune---
+    # All three read the same per-Gaussian vis buffer, which only the "ours" rasterizer produces.
+    atoms_cover_signal = epoch_prune = None
+    need_vis = (opt.optimizer_type != "sparse_adam") or (opt.opa_decay < 1.0) or opt.prune_contrib
+    if need_vis:
+        if args.rasterizer != "ours":
+            raise ValueError("gs-atoms (--optimizer_type / --opa_decay / --prune_contrib) needs --rasterizer ours: "
+                             f"the per-Gaussian vis buffer does not exist under {args.rasterizer!r}.")
+        from atoms import cover_signal as atoms_cover_signal
+        if opt.prune_contrib:
+            from atoms import EpochPrune
+            n_cams = len(scene.getTrainCameras())
+            window = max(n_cams, 250)   # floor: 17-view scenes would otherwise prune ~10x more often
+            epoch_prune = EpochPrune(contrib_min=opt.contrib_min, untouched=opt.prune_untouched,
+                                     window=window, log=print)
+            epoch_prune.start(gaussians.get_xyz.shape[0], gaussians.get_xyz.device)
+            gaussians.epoch_prune = epoch_prune
+            print(f"[INFO] EpochPrune: window {window} steps ({n_cams} train views), "
+                  f"contrib_min {opt.contrib_min}, untouched {opt.prune_untouched}.")
+    epoch_prune_until = opt.epoch_prune_until_iter if opt.epoch_prune_until_iter >= 0 else opt.densify_until_iter
 
     # Additional variables
     iter_start = torch.cuda.Event(enable_timing = True)
@@ -235,6 +335,12 @@ def training(
 
         iter_start.record()
         gaussians.update_learning_rate(iteration)
+        # > Past --bilagrid_until the grid is frozen and the losses see the raw render.
+        bilagrid_on = bilagrid is not None and bilagrid.is_active(iteration)
+        if bilagrid_on:
+            bilagrid.update_lr(iteration)
+        elif bilagrid is not None and iteration == args.bilagrid_until + 1:
+            print(f"\n[INFO] Bilateral grid off from iteration {iteration}: losses on the raw render.")
 
         # ---Update SH degree---
         if iteration % 1000 == 0:
@@ -278,9 +384,21 @@ def training(
         # we use the rasterizer compatible with depth and normal rendering.
         render_pkg = render(
             viewpoint_cam, gaussians, pipe, bg,
-            require_coord=False, 
+            require_coord=False,
             require_depth=render_depth_in_forward_pass,
+            vis=need_vis,
         )
+        # gs-atoms gate + cover signal, read once and reused by the step, the decay and EpochPrune (B3).
+        # vis[:, 0] is the summed transmittance in front of each Gaussian, so vis[:, 0] > 0 is exactly
+        # "some pixel blended this row" - the same row set as contrib_max > 0, and opacity-independent
+        # (gating on alpha*T instead collapses after an opacity reset; see atoms/gate.py:6-7).
+        atom_gate = atom_cover = atom_contrib = None
+        if need_vis:
+            with torch.no_grad():
+                _vis = render_pkg["vis"]
+                atom_gate = _vis[:, 0] > opt.gate_threshold if opt.gate_threshold > 0 else _vis[:, 0] > 0
+                atom_contrib = _vis[:, 4]
+                atom_cover = atoms_cover_signal(atom_contrib, gaussians._opacity)
 
         # ---Compute losses---
         image, viewspace_point_tensor, visibility_filter, radii = (
@@ -293,13 +411,49 @@ def training(
             gt_image = gt_image * alpha_mask + bg.unsqueeze(-1).unsqueeze(-1) * (1.0 - alpha_mask)
 
         # Rendering loss
-        if args.decoupled_appearance or args.exposure_compensation:
-            Ll1 = L1_loss_appearance(image, gt_image, gaussians, viewpoint_cam.uid)
+        is_generated_view = viewpoint_cam.image_name in lpips_names
+        if is_generated_view:
+            # ArtiFixer3D distillation: generated frames only get lambda_lpips * LPIPS(vgg), without
+            # appearance compensation or confidence, so their inconsistencies do not blur the model.
+            loss = args.lambda_lpips * lpips(image.clamp(0, 1) * 2 - 1, gt_image * 2 - 1, net_type='vgg').mean()
+        elif use_robust_loss:
+            compensated = None
+            if bilagrid is None and gaussians.use_exposure_compensation:
+                compensated = L1_loss_appearance(image, gt_image, gaussians, viewpoint_cam.uid, return_transformed_image=True)
+            confidence_map = None
+            if args.confidence and iteration >= args.conf_from_iter:
+                confidence_map = render_confidence(viewpoint_cam, gaussians, pipe)
+            # > Grid (while active) + its TV / identity / mean pulls, and the optional raw-render term (--lambda_raw).
+            loss, _ = appearance_photometric_loss(
+                image, gt_image, iteration, bilagrid=bilagrid, view_idx=viewpoint_cam.uid, compensated=compensated,
+                # Exposure compensation stays close to GW's rule (L1 on the compensated image, SSIM on the raw render).
+                decoupled=args.appearance in ("bilagrid+decoupled", "exposure"), lambda_raw=args.lambda_raw,
+                lambda_dssim=opt.lambda_dssim, confidence_map=confidence_map, conf_beta=args.conf_beta,
+                ignore_mask=load_ignore_mask(args.ignore_masks, viewpoint_cam.image_name, image.shape[1], image.shape[2]),
+            )
         else:
-            Ll1 = l1_loss(image, gt_image)
-        ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0), padding="valid")
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
-        
+            if args.decoupled_appearance or args.exposure_compensation:
+                Ll1 = L1_loss_appearance(image, gt_image, gaussians, viewpoint_cam.uid)
+            else:
+                Ll1 = l1_loss(image, gt_image)
+            ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0), padding="valid")
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+
+        # Colour and normal variance along rays (CoMe)
+        if use_variance_losses and (iteration >= args.var_from_iter) and not is_generated_view:
+            color_var_loss, normal_var_loss = variance_losses(viewpoint_cam, gaussians, pipe, gt_image, bg_color=bg)
+            loss = loss + args.lambda_color_var * color_var_loss + args.lambda_normal_var * normal_var_loss
+
+        # Hollowing losses (0 when off)
+        # ---B9: pull the rendered alpha towards 1 where the ray already hits something---
+        # Weighted by (alpha > alpha_floor) so the term completes thin, partly-transparent surfaces
+        # without seeding geometry in empty sky, which has no background model on the 360 scenes.
+        if opt.lambda_alpha > 0:
+            _alpha = render_pkg["alpha"]
+            _w = (_alpha.detach() > opt.alpha_floor).float()
+            loss = loss + opt.lambda_alpha * (_w * (1.0 - _alpha)).sum() / _w.sum().clamp_min(1.0)
+        loss = loss + hollow.loss(iteration)
+
         # Depth-Normal Consistency Regularization
         if reg_kick_on:
             if args.mask_depth_normal:
@@ -475,6 +629,14 @@ def training(
         iter_end.record()
 
         with torch.no_grad():
+            # ---Final hollowing prune---
+            # > Runs before the logging below, which saves the last iteration.
+            hollow_has_changed = False
+            if iteration == opt.iterations:
+                hollow_has_changed = hollow.after_step(iteration)
+                if hollow_has_changed and not use_mip_filter:
+                    gaussians.reset_3D_filter()
+
             # ---Logging---
             (
                 postfix_dict,
@@ -524,6 +686,10 @@ def training(
                 ema_occupied_centers_loss_for_log,
                 testing_iterations, saving_iterations, render,
             )
+            # > The grid next to every saved PLY (not only checkpoints); a checkpoint at the same iteration overwrites
+            # > it with the post-step grid below.
+            if bilagrid is not None and iteration in saving_iterations:
+                torch.save(bilagrid.state_dict(), os.path.join(scene.model_path, f"bilagrid{iteration}.pth"))
             
             if iteration % 100 == 0:
                 if dataset.use_unbounded_opacity:
@@ -533,8 +699,8 @@ def training(
                     print(f"Min opacity: {_opacity.min()}, Max opacity: {_opacity.max()}")
 
             # ---Densification---
-            gaussians_have_changed = False
-            if iteration < opt.densify_until_iter:
+            gaussians_have_changed = hollow_has_changed
+            if iteration < opt.densify_until_iter and not hollow_has_changed:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats_radegs(viewspace_point_tensor, visibility_filter)
@@ -544,9 +710,11 @@ def training(
                     if not args.use_max_size_threshold:
                         size_threshold = None
                     gaussians.densify_and_prune_radegs(
-                        opt.densify_grad_threshold, 0.05, scene.cameras_extent, size_threshold, 
+                        opt.densify_grad_threshold, 0.05, scene.cameras_extent, size_threshold,
                         use_abs_grad=args.use_abs_grad_for_densification,
                         viewpoint_cameras=scene.getTrainCameras().copy(),
+                        budget=current_budget(iteration, opt.densify_from_iter, opt.densify_until_iter,
+                                              opt.budget_cap, opt.budget_warmup_offset),
                     )
                     gaussians_have_changed = True
                     if use_mip_filter:
@@ -556,8 +724,37 @@ def training(
                     else:
                         gaussians.reset_3D_filter()
                         
-                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                if opt.opacity_reset and (
+                    iteration % opt.opacity_reset_interval == 0
+                    or (dataset.white_background and iteration == opt.densify_from_iter)
+                ):
                     gaussians.reset_opacity()
+
+                # ---gs-atoms B6: gated opacity decay, the replacement for the reset---
+                # decay_opacity_ does logit(sigmoid(raw) * factor) in place on gated rows only. Safe under
+                # the 3D Mip filter, whose coefficient depends only on scaling and filter_3D, but WRONG
+                # under --use_unbounded_opacity, where the opacity activation is exp rather than sigmoid.
+                if opt.opa_decay < 1.0 and atom_gate is not None:
+                    if gaussians.use_unbounded_opacity:
+                        raise ValueError("--opa_decay assumes a sigmoid opacity activation and cannot be "
+                                         "combined with --use_unbounded_opacity.")
+                    atoms_decay_opacity_(gaussians._opacity.data, atom_gate, opt.opa_decay)
+
+            # ---gs-atoms B7: the per-epoch contribution prune---
+            # Placed after densification so the row count is settled. Rows whose blend mass stayed below
+            # contrib_min for a whole epoch die; newborns are exempt for their first window.
+            if epoch_prune is not None and atom_contrib is not None:
+                epoch_prune.update(atom_contrib, atom_gate)
+                if epoch_prune.due() and iteration <= epoch_prune_until and not gaussians_have_changed:
+                    dead = epoch_prune.rule()
+                    if dead is not None and bool(dead.any()):
+                        gaussians.prune_points(dead)
+                        gaussians_have_changed = True
+                        if use_mip_filter:
+                            gaussians.compute_3D_filter(cameras=scene.getTrainCameras().copy())
+                        else:
+                            gaussians.reset_3D_filter()
+                    epoch_prune.start(gaussians.get_xyz.shape[0], gaussians.get_xyz.device)
                     
             # ---Non-maximal pruning---
             if iteration in args.non_maximal_pruning_iterations:
@@ -653,6 +850,13 @@ def training(
                             cameras=scene.getTrainCameras().copy()
                         )
 
+            # ---Hollowing: opacity decay, unseen pruning, see-through carving---
+            # > HollowSchedule recomputes the 3D filter itself after a prune.
+            if iteration < opt.iterations and hollow.after_step(iteration):
+                gaussians_have_changed = True
+                if not use_mip_filter:
+                    gaussians.reset_3D_filter()
+
             # ---Reset Normal field state if Gaussians have changed---
             if normal_field_kick_on and gaussians_have_changed:
                 normal_field_state = reset_normal_field_state_at_next_iteration(normal_field_state)
@@ -677,20 +881,59 @@ def training(
                     gaussians.optimizer.step()
                 else:
                     visible = radii>0
-                    gaussians.optimizer.step(visible, radii.shape[0])
+                    # > The free-space prior also reaches Gaussians outside the view.
+                    if hollow.touched is not None:
+                        visible = visible | hollow.touched
+                    if atom_gate is not None:
+                        # The contrib gate is the row set gs-atoms updates; keep the hollow union or the
+                        # free-space prior can no longer move the rows it samples (B5).
+                        visible = visible | atom_gate
+                    if opt.optimizer_type == "view_adam":
+                        gaussians.optimizer.step(visible, row_signal=atom_cover)
+                    elif opt.optimizer_type == "row_adam":
+                        gaussians.optimizer.step(visible)
+                    else:
+                        gaussians.optimizer.step(visible, radii.shape[0])
                 gaussians.optimizer.zero_grad(set_to_none = True)
+                if bilagrid_on:
+                    bilagrid.step()
+                    bilagrid.zero_grad()
 
             # ---Save checkpoint---
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")  
-                
+                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+                if bilagrid is not None:
+                    torch.save(bilagrid.state_dict(), scene.model_path + "/bilagrid" + str(iteration) + ".pth")
+
         if iteration % 100 == 0:
             torch.cuda.empty_cache()
             gc.collect()
 
     print('Num of Gaussians: %d'%(gaussians._xyz.shape[0]))
-    
+
+    # ---Gaussian statistics (fog, size, time)---
+    with torch.no_grad():
+        opacity = gaussians.get_opacity_with_3D_filter.squeeze(-1)
+        p = opacity.clamp(1e-6, 1.0 - 1e-6)
+        stats = {
+            "n_gaussians": int(opacity.numel()),
+            "opacity_below_0.05": float((opacity < 0.05).float().mean()),
+            "opacity_below_0.1": float((opacity < 0.1).float().mean()),
+            "opacity_median": float(opacity.median()),
+            "opacity_entropy": float((-(p * p.log() + (1 - p) * (1 - p).log())).mean()),
+            "train_seconds": time.time() - time_start,
+            "lpips_only_images": len(lpips_names),
+            "appearance": args.appearance,
+            "lambda_raw": args.lambda_raw,
+            "bilagrid": None if bilagrid is None else {**robust.bilagrid_config(args), **bilagrid.drift_stats()},
+            "confidence": bool(args.confidence),
+            "hollow": bool(hollow.enabled),
+        }
+    with open(os.path.join(scene.model_path, "gs_stats.json"), "w") as f:
+        json.dump(stats, f, indent=2)
+    print(f"[INFO] Stats: {stats}")
+
     if WANDB_FOUND:
         run.finish()
     
@@ -798,9 +1041,26 @@ if __name__ == "__main__":
     # ----- Appearance Network for Exposure-aware loss -----
     # > Inspired by GOF.
     parser.add_argument("--decoupled_appearance", action="store_true")
-    # > Inspired by PGSR.
-    parser.add_argument("--exposure_compensation", action=BooleanOptionalAction, default=True)
-    
+    # > Inspired by PGSR. Default None: on unless --appearance or --decoupled_appearance picks another mode.
+    parser.add_argument("--exposure_compensation", action=BooleanOptionalAction, default=None)
+
+    # ----- Robustness to non-clean data (robust/) -----
+    # > --appearance {none,exposure,network,bilagrid,bilagrid+decoupled}; unset = GW's legacy flags above.
+    robust.add_args(parser)
+    parser.set_defaults(appearance=None)
+
+    # ----- Hollowing (hollow/) -----
+    HollowSchedule.add_args(parser)
+
+    # ----- BEA-GS labels -----
+    parser.add_argument("--labels", type=str, default=None,
+        help="labels.pt (int32, one per Gaussian) registered as a per-Gaussian extra; needs a matching --start_checkpoint.")
+
+    # ----- ArtiFixer3D distillation -----
+    parser.add_argument("--lpips_images", type=str, default=None,
+        help="File listing image names supervised by lambda_lpips * LPIPS only (ArtiFixer3D generated frames).")
+    parser.add_argument("--lambda_lpips", type=float, default=0.1)
+
     # ----- PGSR losses -----
     parser.add_argument("--use_scale_loss", action="store_true")
     parser.add_argument("--scale_loss_weight", type=float, default=100.0)
@@ -820,6 +1080,9 @@ if __name__ == "__main__":
 
     print("Optimizing " + args.model_path)
     args.use_normal_field = not args.no_normal_field
+    resolve_appearance(args)
+    robust.check_args(args)
+    print(f"[INFO] Appearance: {args.appearance}.")
     
     if args.port == -1:
         args.port = np.random.randint(5000, 9000)

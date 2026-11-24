@@ -2,6 +2,12 @@ from typing import Optional
 import math
 import torch
 from diff_gaussian_rasterization_ours import GaussianRasterizationSettings, GaussianRasterizer
+try:
+    # BEA-GS build of the same rasterizer (adds labels: SAG + votes); identical output without labels
+    from diff_gaussian_rasterization_ours_beags import GaussianRasterizationSettings as LabelRasterizationSettings
+    from diff_gaussian_rasterization_ours_beags import GaussianRasterizer as LabelRasterizer
+except ImportError:
+    LabelRasterizationSettings, LabelRasterizer = None, None
 from scene.cameras import Camera
 from scene.gaussian_model import GaussianModel
 
@@ -16,12 +22,36 @@ def render_ours(
     require_coord : bool = False,
     require_depth : bool = True,
     colors_precomp : Optional[torch.Tensor]=None,
+    mask : Optional[torch.Tensor]=None,
+    gaussian_labels : Optional[torch.Tensor]=None,
+    pixel_labels : Optional[torch.Tensor]=None,
+    num_labels : int=0,
+    vis : bool=False,
 ):
     """
     Render the scene. 
     
     Background tensor (bg_color) must be on GPU!
+
+    mask: bool [P], only the selected Gaussians are rasterized. radii, visibility_filter and votes
+        are scattered back to full length P; viewspace_points stays full length.
+    gaussian_labels: int [P], pixel_labels: int [H, W] (-1 = unlabeled), num_labels: L.
+        Adds "sag" (1, H, W), the sum of alpha*T over Gaussians whose label != pixel label
+        (gradient only to those Gaussians), and "votes" (P, L), the sum of alpha*T over pixels
+        with label l (no grad). Both are None without labels. Requires diff_gaussian_rasterization_ours_beags.
+    vis: adds "vis" (P, 5), no grad (GAVIS visibility, beags/visibility.py): per Gaussian the sum of the
+        transmittance T in front of it over the pixels it covers, the number of those pixels, its footprint
+        area in pixels (0 when culled), the max of alpha*T over the labelled pixels it covers (0 without
+        pixel_labels: "does it dominate some pixel"), and the sum of alpha*T over every pixel it covers
+        (its blend mass, gs-atoms EpochPrune). None when off. Requires diff_gaussian_rasterization_ours_beags.
     """
+    use_labels = gaussian_labels is not None
+    if LabelRasterizer is not None:
+        RasterizationSettings, Rasterizer = LabelRasterizationSettings, LabelRasterizer
+    elif use_labels or vis:
+        raise ImportError("Rendering with labels or vis requires diff_gaussian_rasterization_ours_beags")
+    else:
+        RasterizationSettings, Rasterizer = GaussianRasterizationSettings, GaussianRasterizer
 
     # Set up rasterization configuration
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
@@ -34,7 +64,7 @@ def render_ours(
     
     active_sg_degree = 0
 
-    raster_settings = GaussianRasterizationSettings(
+    raster_settings = RasterizationSettings(
         image_height=int(viewpoint_camera.image_height),
         image_width=int(viewpoint_camera.image_width),
         tanfovx=tanfovx,
@@ -52,10 +82,10 @@ def render_ours(
         debug=pipe.debug
     )
 
-    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+    rasterizer = Rasterizer(raster_settings=raster_settings)
 
     means3D = pc.get_xyz
-    means2D = screenspace_points
+    means2D = screenspace_points  # full length P; a masked view is passed to the rasterizer
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -76,12 +106,26 @@ def render_ours(
     # sg_sharpness = pc.get_sg_sharpness
     # sg_color = pc.get_sg_color
     
-    n_gaussians = pc._xyz.shape[0]
+    n_total = pc._xyz.shape[0]
+    if mask is not None:
+        means3D, means2D, opacity, scales, rotations = means3D[mask], means2D[mask], opacity[mask], scales[mask], rotations[mask]
+        shs = shs[mask] if shs is not None else None
+        colors_precomp = colors_precomp[mask] if colors_precomp is not None else None
+        gaussian_labels = gaussian_labels[mask] if use_labels else None
+
+    n_gaussians = means3D.shape[0]
     sg_axis = torch.zeros(n_gaussians, active_sg_degree, 3, device=pc._xyz.device)
     sg_sharpness = torch.zeros(n_gaussians, active_sg_degree, device=pc._xyz.device)
     sg_color = torch.zeros(n_gaussians, active_sg_degree, 3, device=pc._xyz.device)
 
-    rendered_image, radii, rendered_median_depth, rendered_alpha, rendered_normal = rasterizer(
+    label_kwargs = {}
+    if use_labels:
+        label_kwargs = dict(gaussian_labels=gaussian_labels, pixel_labels=pixel_labels, num_labels=num_labels)
+    vis_out = None
+    if vis:
+        vis_out = torch.zeros(n_gaussians, 5, dtype=torch.float32, device=pc._xyz.device)
+        label_kwargs["vis"] = vis_out
+    outputs = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = shs,
@@ -93,7 +137,23 @@ def render_ours(
         scales = scales,
         rotations = rotations,
         cov3D_precomp = cov3D_precomp,
+        **label_kwargs,
     )
+    rendered_image, radii, rendered_median_depth, rendered_alpha, rendered_normal = outputs[:5]
+    sag, votes = outputs[5:] if use_labels else (None, None)
+
+    if mask is not None:
+        radii_full = radii.new_zeros(n_total)
+        radii_full[mask] = radii
+        radii = radii_full
+        if votes is not None:
+            votes_full = votes.new_zeros(n_total, votes.shape[1])
+            votes_full[mask] = votes
+            votes = votes_full
+        if vis_out is not None:
+            vis_full = vis_out.new_zeros(n_total, 5)
+            vis_full[mask] = vis_out
+            vis_out = vis_full
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
@@ -103,10 +163,14 @@ def render_ours(
             "median_coord": None,
             "expected_depth": rendered_median_depth,
             "median_depth": rendered_median_depth,
-            "viewspace_points": means2D,
+            "viewspace_points": screenspace_points,
             "visibility_filter" : radii > 0,
             "radii": radii,
             "normal":rendered_normal,
+            "alpha": rendered_alpha,
+            "sag": sag,
+            "votes": votes,
+            "vis": vis_out,
             }
 
 

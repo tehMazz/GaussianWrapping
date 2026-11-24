@@ -1,0 +1,11 @@
+# BEA-GS on Gaussian Wrapping: Python packages on top of GW's requirements.txt (GWBEAGS.md, Setup).
+#   uv pip install --python <env>/bin/python -r requirements_beags.txt
+# The CUDA extension with the BEA-GS labels (votes, SAG) is built from the repo:
+#   uv pip install --python <env>/bin/python --no-build-isolation -e submodules/diff-gaussian-rasterization_ours_beags
+pytest
+plyfile
+scipy
+opencv-python
+pillow
+# Optional: export_3dgs_ply.py --check (gsplat vs native renders). Not needed by training or BEA-GS.
+# gsplat==1.5.3

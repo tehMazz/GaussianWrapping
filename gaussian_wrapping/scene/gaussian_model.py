@@ -33,6 +33,92 @@ except:
     pass
 from torch.optim import Adam
 
+# --- gs-atoms per-row optimizer state (B1) ------------------------------------------------------
+# Stock Adam keeps exactly exp_avg / exp_avg_sq, which the three surgery helpers below resize by name.
+# RowAdam / ViewAdam add further [N, ...] state (row clock, kick switch, signal reference, step-weight
+# EMA, means-lr multiplier); any of those left unresized desyncs against the Gaussian count and then
+# weights the wrong rows while still rendering plausibly. atoms.host_state resizes them generically.
+# All three wrappers are no-ops under the stock optimizer, where no such key exists.
+try:
+    from atoms import host_state as _atoms_host_state
+except Exception:                                       # gs-atoms not on PYTHONPATH: stock behaviour
+    _atoms_host_state = None
+
+# Keys the stock helpers already resize by name; host_state must not touch them twice.
+_STOCK_STATE_KEYS = ("exp_avg", "exp_avg_sq")
+
+
+def _row_state_view(stored_state):
+    """The per-row state minus the keys the caller resized itself."""
+    return {k: v for k, v in stored_state.items() if k not in _STOCK_STATE_KEYS}
+
+
+def _row_state_apply(stored_state, view):
+    stored_state.update(view)
+
+
+def _row_state_index(stored_state, n_before, index):
+    if _atoms_host_state is None:
+        return
+    view = _row_state_view(stored_state)
+    _atoms_host_state.index_rows(view, n_before, index)
+    _row_state_apply(stored_state, view)
+
+
+def _row_state_cat(stored_state, n_before, n_new, src=None):
+    if _atoms_host_state is None:
+        return
+    view = _row_state_view(stored_state)
+    _atoms_host_state.cat_rows(view, n_before, n_new, src=src)
+    _row_state_apply(stored_state, view)
+
+
+def _row_state_replace(stored_state, n, new):
+    if _atoms_host_state is None:
+        return
+    view = _row_state_view(stored_state)
+    _atoms_host_state.replace_rows(view, n, new)
+    _row_state_apply(stored_state, view)
+
+
+def _row_state_reset(stored_state, n, idx=None):
+    if _atoms_host_state is None:
+        return
+    view = _row_state_view(stored_state)
+    _atoms_host_state.reset_rows(view, n, idx)
+    _row_state_apply(stored_state, view)
+
+
+def _trim_to_budget(selected_pts_mask, score, headroom):
+    """Keep the top-`headroom` candidates of `selected_pts_mask`, ranked by `score` (B8).
+
+    Both radegs densify paths grow the model by exactly +1 Gaussian per selected candidate
+    (split appends N=2 and prunes the parent), so headroom is a straight count.
+    `score` must already be padded to the same length as the mask.
+    """
+    n_sel = int(selected_pts_mask.sum())
+    if headroom is None or n_sel <= headroom:
+        return selected_pts_mask
+    if headroom <= 0:
+        return torch.zeros_like(selected_pts_mask)
+    idx = selected_pts_mask.nonzero(as_tuple=True)[0]
+    keep = idx[torch.topk(score.reshape(-1)[idx], headroom).indices]
+    trimmed = torch.zeros_like(selected_pts_mask)
+    trimmed[keep] = True
+    return trimmed
+
+
+def current_budget(iteration, densify_from, densify_until, cap, warmup_offset=500):
+    """Improved-GS sqrt budget ramp: sqrt(progress) * cap until the ramp completes, then cap."""
+    if not cap:
+        return None
+    end = max(densify_until - warmup_offset, densify_from + 1)
+    if iteration >= end:
+        return cap
+    progress = max(0.0, (iteration - densify_from) / float(end - densify_from))
+    return max(int((progress ** 0.5) * cap), 1)
+
+
 def init_cdf_mask(importance, thres=1.0):
     importance = importance.flatten()   
     if thres!=1.0:
@@ -50,6 +136,11 @@ def init_cdf_mask(importance, thres=1.0):
 
 
 class GaussianModel:
+
+    # Parent row of each newborn, set only for the duration of a cat_tensors_to_optimizer call (B1).
+    _cat_parent_idx = None
+    # gs-atoms EpochPrune, attached by train.py when --prune_contrib is on; None keeps stock behaviour (B7).
+    epoch_prune = None
 
     def setup_functions(self, use_unbounded_opacity: bool = False):
         def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
@@ -145,6 +236,16 @@ class GaussianModel:
         if self.use_unbounded_opacity:
             print("[INFO] Using unbounded opacity")
 
+        # Per-Gaussian non-optimized tensors (e.g. BEA-GS labels), kept aligned by every prune/densify.
+        # default_for_new: "parent" (children copy their parent's value) or "zero".
+        self.extras = {}
+        self._extras_default = {}
+
+        # Optional per-Gaussian confidence (CoMe), learned in log space and initialized to 0.
+        self.use_confidence = False
+        self.confidence_lr = 2.5e-4
+        self._confidence = torch.empty(0)
+
     def capture(self):
         to_return = (
             self.active_sh_degree,
@@ -168,6 +269,13 @@ class GaussianModel:
             to_return += (self._appearance_embeddings,)
         if self.use_gaussian_features:
             to_return += (self._gaussian_features,)
+        to_return += ({
+            "extras": dict(self.extras),
+            "extras_default": dict(self._extras_default),
+            "use_confidence": self.use_confidence,
+            "confidence_lr": self.confidence_lr,
+            "confidence": self._confidence if self.use_confidence else None,
+        },)
         return to_return
     
     def restore(self, model_args, training_args):
@@ -201,6 +309,17 @@ class GaussianModel:
 
         if self.use_gaussian_features:
             self._gaussian_features = model_args[start_idx]
+            start_idx = start_idx + 1
+
+        # Extras and confidence (absent in checkpoints written before they existed)
+        if start_idx < len(model_args) and isinstance(model_args[start_idx], dict) and "extras" in model_args[start_idx]:
+            extras_args = model_args[start_idx]
+            self.extras = dict(extras_args["extras"])
+            self._extras_default = dict(extras_args["extras_default"])
+            self.use_confidence = extras_args["use_confidence"]
+            self.confidence_lr = extras_args["confidence_lr"]
+            if self.use_confidence:
+                self._confidence = extras_args["confidence"]
             start_idx = start_idx + 1
 
         if start_idx != len(model_args):
@@ -252,7 +371,23 @@ class GaussianModel:
     @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
-    
+
+    @property
+    def get_confidence(self):
+        return torch.exp(self._confidence)
+
+    @property
+    def labels(self):
+        return self.extras.get("labels", None)
+
+    @labels.setter
+    def labels(self, labels):
+        if labels is None:
+            self.extras.pop("labels", None)
+            self._extras_default.pop("labels", None)
+        else:
+            self.register_extra("labels", labels.int(), default_for_new="parent")
+
     # TODO: Add 3D filter
     @property
     def get_opacity_with_3D_filter(self):
@@ -682,6 +817,11 @@ class GaussianModel:
         if self.use_gaussian_features:
             gaussian_features = torch.zeros((self._xyz.shape[0], self.n_gaussian_features), device="cuda")
             self._gaussian_features = nn.Parameter(gaussian_features.requires_grad_(True))
+            
+        self.extras = {}
+        self._extras_default = {}
+        if self.use_confidence:
+            self._confidence = nn.Parameter(torch.zeros((self._xyz.shape[0], 1), device="cuda").requires_grad_(True))
         
     def _get_tetra_points(
         self, 
@@ -849,14 +989,66 @@ class GaussianModel:
             with torch.no_grad():
                 return self._get_tetra_points(**kwargs)
 
+    def register_extra(self, name: str, tensor: torch.Tensor, default_for_new: str = "parent"):
+        """
+        Register a per-Gaussian tensor of shape (N_gaussians, ...) that is not optimized but is kept
+        aligned with the Gaussians by pruning, densification and capture/restore.
+
+        Args:
+            name (str): Key in self.extras.
+            tensor (torch.Tensor): Has shape (N_gaussians, ...).
+            default_for_new (str): "parent" (new Gaussians copy their parent's value) or "zero".
+        """
+        if default_for_new not in ["parent", "zero"]:
+            raise ValueError(f"Unknown default_for_new: {default_for_new}")
+        if tensor.shape[0] != self._xyz.shape[0]:
+            raise ValueError(f"Extra {name} has {tensor.shape[0]} entries, but there are {self._xyz.shape[0]} Gaussians.")
+        self.extras[name] = tensor.detach().to(self._xyz.device)
+        self._extras_default[name] = default_for_new
+
+    def _prune_extras(self, valid_points_mask):
+        for name in self.extras:
+            self.extras[name] = self.extras[name][valid_points_mask]
+
+    def _extend_extras(self, n_new: int, parent_idx: Optional[torch.Tensor]):
+        for name, tensor in self.extras.items():
+            if self._extras_default[name] == "parent":
+                new_values = tensor[parent_idx]
+            else:
+                new_values = torch.zeros((n_new,) + tuple(tensor.shape[1:]), dtype=tensor.dtype, device=tensor.device)
+            self.extras[name] = torch.cat((tensor, new_values), dim=0)
+
+    def enable_confidence(self, lr: float = 2.5e-4):
+        """
+        Add a learnable per-Gaussian confidence (CoMe), stored as a log-confidence initialized to 0.
+        If the optimizer already exists, the parameter is added to it as group "confidence".
+        """
+        self.use_confidence = True
+        self.confidence_lr = lr
+        if self._confidence.shape[0] != self._xyz.shape[0]:
+            confidence = torch.zeros((self._xyz.shape[0], 1), device=self._xyz.device)
+            self._confidence = nn.Parameter(confidence.requires_grad_(True))
+        if (self.optimizer is not None) and all(group["name"] != "confidence" for group in self.optimizer.param_groups):
+            self.optimizer.add_param_group({'params': [self._confidence], 'lr': lr, "name": "confidence"})
+
+    def get_confidence_scaled_threshold(self, threshold):
+        """
+        Divide the densification threshold of each Gaussian by its confidence, clamped to at most 1,
+        such that low-confidence Gaussians are harder to densify (CoMe).
+        """
+        if not self.use_confidence:
+            return threshold
+        confidence = torch.clamp(torch.exp(self._confidence.detach()).squeeze(-1), min=1e-6, max=1.0)  # (N_gaussians,)
+        return threshold / confidence
+
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device=self._xyz.device)
+        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device=self._xyz.device)
         
         if self.use_radegs_densification:
-            self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-            self.xyz_gradient_accum_abs_max = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+            self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device=self._xyz.device)
+            self.xyz_gradient_accum_abs_max = torch.zeros((self.get_xyz.shape[0], 1), device=self._xyz.device)
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -886,11 +1078,14 @@ class GaussianModel:
         if self.use_gaussian_features:
             # TODO: Add a proper learning rate in training_args.
             l.append({'params': [self._gaussian_features], 'lr': training_args.gaussian_features_lr, "name": "gaussian_features"})
+            
+        if self.use_confidence:
+            l.append({'params': [self._confidence], 'lr': self.confidence_lr, "name": "confidence"})
 
         if self.use_appearance_network or self.use_exposure_compensation:
             self.optimizer = Adam(l, lr=0.0, eps=1e-15)
         else:
-            self.optimizer = SparseGaussianAdam(l, lr=0.0, eps=1e-15)
+            self.optimizer = self._build_sparse_optimizer(l, training_args)
 
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
@@ -929,6 +1124,8 @@ class GaussianModel:
         if self.use_gaussian_features:
             for i in range(self._gaussian_features.shape[1]):
                 l.append('gaussian_features_{}'.format(i))
+        if self.use_confidence:
+            l.append('confidence')
         return l
 
     def save_ply(self, path):
@@ -951,6 +1148,9 @@ class GaussianModel:
             
         if self.use_gaussian_features:
             gaussian_features = self._gaussian_features.detach().cpu().numpy()
+            
+        if self.use_confidence:
+            confidence = self._confidence.detach().cpu().numpy()
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
@@ -962,10 +1162,16 @@ class GaussianModel:
             to_concatenate = to_concatenate + (base_occupancy, occupancy_shift)
         if self.use_gaussian_features:
             to_concatenate = to_concatenate + (gaussian_features,)
+        if self.use_confidence:
+            to_concatenate = to_concatenate + (confidence,)
         attributes = np.concatenate(to_concatenate, axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
+        
+        # BEA-GS labels, int32 (N_gaussians,), next to the PLY
+        if self.labels is not None:
+            torch.save(self.labels.int().cpu(), os.path.join(os.path.dirname(path), "labels.pt"))
 
     def reset_opacity(self):
         if self.use_mip_filter:
@@ -1070,6 +1276,13 @@ class GaussianModel:
         else:
             print(f"[INFO] No gaussian features found in ply file.")
             self.use_gaussian_features = False
+            
+        if "confidence" in [p.name for p in plydata.elements[0].properties]:
+            print(f"[INFO] Loading confidence from ply file.")
+            self.use_confidence = True
+            confidence = np.asarray(plydata.elements[0]["confidence"])[..., np.newaxis]
+        else:
+            self.use_confidence = False
 
         self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").contiguous().requires_grad_(True))
         self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
@@ -1084,8 +1297,48 @@ class GaussianModel:
             self._occupancy_shift = nn.Parameter(torch.tensor(occupancy_shift, dtype=torch.float, device="cuda").requires_grad_(True))
         if self.use_gaussian_features:
             self._gaussian_features = nn.Parameter(torch.tensor(gaussian_features, dtype=torch.float, device="cuda").requires_grad_(True))
+        if self.use_confidence:
+            self._confidence = nn.Parameter(torch.tensor(confidence, dtype=torch.float, device="cuda").requires_grad_(True))
+        else:
+            self._confidence = torch.empty(0)
+            
+        self.extras = {}
+        self._extras_default = {}
+        labels_path = os.path.join(os.path.dirname(path), "labels.pt")
+        if os.path.exists(labels_path):
+            print(f"[INFO] Loading labels from {labels_path}.")
+            self.labels = torch.load(labels_path, map_location="cuda")
 
         self.active_sh_degree = self.max_sh_degree
+
+    def _build_sparse_optimizer(self, param_groups, training_args):
+        """The per-Gaussian optimizer: stock SparseGaussianAdam, or a gs-atoms row/view Adam (B4).
+
+        ViewAdam is constructed directly rather than through atoms.make_view_adam, which hardcodes
+        norm="geo". view_groups limits the view weighting to the geometry groups; colour and opacity
+        take plain RowAdam steps, as in the validated gs-atoms arms.
+        """
+        kind = getattr(training_args, "optimizer_type", "sparse_adam")
+        if kind == "sparse_adam":
+            return SparseGaussianAdam(param_groups, lr=0.0, eps=1e-15)
+        try:
+            from atoms import RowAdam, ViewAdam
+        except Exception as exc:                 # never fall back silently to a different optimizer
+            raise RuntimeError(
+                f"--optimizer_type {kind} needs gs-atoms on PYTHONPATH (slurm/common.sh sets GSATOMS): {exc}"
+            ) from exc
+        common = dict(lr=0.0, betas=(0.9, 0.999), eps=1e-15, masked=True,
+                      kick_gamma=1.0, kick_betas=(0.9, 0.999), kick_mult=1.0, kick_warmup=True)
+        if kind == "row_adam":
+            print("[INFO] optimizer: gs-atoms RowAdam (per-row clock)")
+            return RowAdam(param_groups, **common)
+        if kind == "view_adam":
+            norm = getattr(training_args, "view_norm", "max")
+            print(f"[INFO] optimizer: gs-atoms ViewAdam (norm={norm}, geometry groups only)")
+            return ViewAdam(param_groups, step_pow=1.0, memory=True, norm=norm, step_norm=True,
+                            norm_decay=0.98, floor=0.05, unseen_plain=True,
+                            view_groups={"xyz", "scaling", "rotation"}, **common)
+        raise ValueError(f"--optimizer_type must be sparse_adam, row_adam or view_adam, not {kind!r}")
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
@@ -1096,6 +1349,8 @@ class GaussianModel:
                 stored_state = self.optimizer.state.get(group['params'][0], None)
                 stored_state["exp_avg"] = torch.zeros_like(tensor)
                 stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
+                # RowAdam/ViewAdam keep extra [N, ...] state; resize it too or it desyncs silently.
+                _row_state_replace(stored_state, group["params"][0].shape[0], tensor)
 
                 del self.optimizer.state[group['params'][0]]
                 group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
@@ -1111,8 +1366,10 @@ class GaussianModel:
                 continue
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
+                n_before = group["params"][0].shape[0]
                 stored_state["exp_avg"] = stored_state["exp_avg"][mask]
                 stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
+                _row_state_index(stored_state, n_before, mask)
 
                 del self.optimizer.state[group['params'][0]]
                 group["params"][0] = nn.Parameter((group["params"][0][mask].requires_grad_(True)))
@@ -1142,6 +1399,15 @@ class GaussianModel:
         if self.use_gaussian_features:
             self._gaussian_features = optimizable_tensors["gaussian_features"]
             
+        if self.use_confidence:
+            self._confidence = optimizable_tensors["confidence"]
+        self._prune_extras(valid_points_mask)
+        # gs-atoms EpochPrune keeps per-row window state; it must follow every row removal (B7).
+        if self.epoch_prune is not None:
+            self.epoch_prune.keep(valid_points_mask)
+        if hasattr(self, "filter_3D") and self.filter_3D.shape[0] == valid_points_mask.shape[0]:
+            self.filter_3D = self.filter_3D[valid_points_mask]
+            
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
         if self.use_radegs_densification:
             self.xyz_gradient_accum_abs = self.xyz_gradient_accum_abs[valid_points_mask]
@@ -1163,9 +1429,10 @@ class GaussianModel:
             extension_tensor = tensors_dict[group["name"]]
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
+                n_before = group["params"][0].shape[0]
                 stored_state["exp_avg"] = torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0)
                 stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=0)
-                
+                _row_state_cat(stored_state, n_before, extension_tensor.shape[0], self._cat_parent_idx)
 
                 del self.optimizer.state[group['params'][0]]
                 group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
@@ -1182,7 +1449,15 @@ class GaussianModel:
     def densification_postfix(
         self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, 
         new_base_occupancy=None, new_occupancy_shift=None, new_gaussian_features=None,
+        new_confidence=None, parent_idx=None,
     ):
+        # parent_idx (N_new_gaussians,): index of the Gaussian each new Gaussian comes from.
+        # Required when confidence or extras with default_for_new="parent" are used.
+        n_gaussians_before = self._xyz.shape[0]
+        n_new_gaussians = new_xyz.shape[0]
+        if (parent_idx is None) and any(default == "parent" for default in self._extras_default.values()):
+            raise ValueError("parent_idx is required to densify Gaussians with extras inherited from parents.")
+        
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -1199,8 +1474,23 @@ class GaussianModel:
             if (new_gaussian_features is None):
                 raise ValueError("new_gaussian_features is required when use_gaussian_features is True.")
             d["gaussian_features"] = new_gaussian_features
+            
+        if self.use_confidence:
+            if new_confidence is None:
+                if parent_idx is None:
+                    raise ValueError("new_confidence or parent_idx is required when use_confidence is True.")
+                new_confidence = self._confidence[parent_idx].detach()
+            d["confidence"] = new_confidence
+            
+        if hasattr(self, "filter_3D") and (parent_idx is not None) and self.filter_3D.shape[0] == n_gaussians_before:
+            self.filter_3D = torch.cat((self.filter_3D, self.filter_3D[parent_idx]), dim=0)
 
-        optimizable_tensors = self.cat_tensors_to_optimizer(d)
+        # Newborns inherit the per-row means-lr multiplier from their parent (gs-atoms cat_rows(src=)).
+        self._cat_parent_idx = parent_idx
+        try:
+            optimizable_tensors = self.cat_tensors_to_optimizer(d)
+        finally:
+            self._cat_parent_idx = None
         self._xyz = optimizable_tensors["xyz"]
         self._features_dc = optimizable_tensors["f_dc"]
         self._features_rest = optimizable_tensors["f_rest"]
@@ -1212,13 +1502,19 @@ class GaussianModel:
             self._occupancy_shift = optimizable_tensors["occupancy_shift"]
         if self.use_gaussian_features:
             self._gaussian_features = optimizable_tensors["gaussian_features"]
+        if self.use_confidence:
+            self._confidence = optimizable_tensors["confidence"]
+        self._extend_extras(n_new_gaussians, parent_idx)
+        # Newborns enter EpochPrune exempt for their first window (mass_max = inf, touched = True).
+        if self.epoch_prune is not None:
+            self.epoch_prune.grow(n_new_gaussians)
 
-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device=self._xyz.device)
+        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device=self._xyz.device)
         if self.use_radegs_densification:
-            self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-            self.xyz_gradient_accum_abs_max = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+            self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device=self._xyz.device)
+            self.xyz_gradient_accum_abs_max = torch.zeros((self.get_xyz.shape[0], 1), device=self._xyz.device)
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device=self._xyz.device)
 
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
@@ -1285,9 +1581,11 @@ class GaussianModel:
         else:
             new_gaussian_features = None
 
+        parent_idx = torch.arange(self._xyz.shape[0], device=self._xyz.device)[selected_pts_mask]
         self.densification_postfix(
             new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, 
-            new_base_occupancy, new_occupancy_shift, new_gaussian_features
+            new_base_occupancy, new_occupancy_shift, new_gaussian_features,
+            parent_idx=parent_idx,
         )
 
         new_culling = self._culling[selected_pts_mask]
@@ -1297,6 +1595,8 @@ class GaussianModel:
 
 
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
+        # Confidence-based thresholds
+        grad_threshold = self.get_confidence_scaled_threshold(grad_threshold)
         # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
@@ -1321,9 +1621,11 @@ class GaussianModel:
         else:
             new_gaussian_features = None
 
+        parent_idx = torch.arange(self._xyz.shape[0], device=self._xyz.device)[selected_pts_mask]
         self.densification_postfix(
             new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, 
-            new_base_occupancy, new_occupancy_shift, new_gaussian_features
+            new_base_occupancy, new_occupancy_shift, new_gaussian_features,
+            parent_idx=parent_idx,
         )
 
         new_culling = self._culling[selected_pts_mask]
@@ -1334,6 +1636,8 @@ class GaussianModel:
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
+        # Confidence-based thresholds
+        grad_threshold = self.get_confidence_scaled_threshold(grad_threshold)
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
         padded_grad[:grads.shape[0]] = grads.squeeze()
@@ -1364,9 +1668,11 @@ class GaussianModel:
         else:
             new_gaussian_features = None
 
+        parent_idx = torch.arange(self._xyz.shape[0], device=self._xyz.device)[selected_pts_mask].repeat(N)
         self.densification_postfix(
             new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, 
-            new_base_occupancy, new_occupancy_shift, new_gaussian_features
+            new_base_occupancy, new_occupancy_shift, new_gaussian_features,
+            parent_idx=parent_idx,
         )
 
         new_culling = self._culling[selected_pts_mask].repeat(N,1)
@@ -1399,6 +1705,8 @@ class GaussianModel:
 
     def densify_and_split_mask(self, grads, grad_threshold, scene_extent, mask, N=2):
         n_init_points = self.get_xyz.shape[0]
+        # Confidence-based thresholds
+        grad_threshold = self.get_confidence_scaled_threshold(grad_threshold)
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
         padded_grad[:grads.shape[0]] = grads.squeeze()
@@ -1435,9 +1743,11 @@ class GaussianModel:
         else:
             new_gaussian_features = None
 
+        parent_idx = torch.arange(self._xyz.shape[0], device=self._xyz.device)[selected_pts_mask].repeat(N)
         self.densification_postfix(
             new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, 
             new_base_occupancy, new_occupancy_shift, new_gaussian_features,
+            parent_idx=parent_idx,
         )
 
         new_culling = self._culling[selected_pts_mask].repeat(N,1)
@@ -1484,6 +1794,11 @@ class GaussianModel:
             self._occupancy_shift = nn.Parameter(occupancy_shift.requires_grad_(True))
         if self.use_gaussian_features:
             self._gaussian_features = nn.Parameter(gaussian_features.requires_grad_(True))
+        # New points have no parent: extras and confidence are reset to 0
+        for name, tensor in self.extras.items():
+            self.extras[name] = torch.zeros((fused_point_cloud.shape[0],) + tuple(tensor.shape[1:]), dtype=tensor.dtype, device=tensor.device)
+        if self.use_confidence:
+            self._confidence = nn.Parameter(torch.zeros((fused_point_cloud.shape[0], 1), device="cuda").requires_grad_(True))
 
     def init_culling(self, num_views):
         self._culling=torch.zeros((self._xyz.shape[0], num_views), dtype=torch.bool, device='cuda')
@@ -1694,9 +2009,11 @@ class GaussianModel:
         else:
             new_gaussian_features = None
 
+        parent_idx = torch.arange(self._xyz.shape[0], device=self._xyz.device)[selected_pts_mask]
         self.densification_postfix(
             new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, 
-            new_base_occupancy, new_occupancy_shift, new_gaussian_features
+            new_base_occupancy, new_occupancy_shift, new_gaussian_features,
+            parent_idx=parent_idx,
         )
 
         new_culling = self._culling[selected_pts_mask]
@@ -1776,24 +2093,31 @@ class GaussianModel:
         grads_abs, grad_abs_threshold, 
         scene_extent, N=2,
         use_abs_grad:bool=True,
+        budget_headroom=None,
     ):
         assert self.use_radegs_densification
         
         n_init_points = self.get_xyz.shape[0]
+        # Confidence-based thresholds
+        grad_threshold = self.get_confidence_scaled_threshold(grad_threshold)
+        grad_abs_threshold = self.get_confidence_scaled_threshold(grad_abs_threshold)
         # Extract points that satisfy the gradient condition
-        padded_grad = torch.zeros((n_init_points), device="cuda")
+        padded_grad = torch.zeros((n_init_points), device=self._xyz.device)
         padded_grad[:grads.shape[0]] = grads.squeeze()
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
         if use_abs_grad:
-            padded_grad_abs = torch.zeros((n_init_points), device="cuda")
+            padded_grad_abs = torch.zeros((n_init_points), device=self._xyz.device)
             padded_grad_abs[:grads_abs.shape[0]] = grads_abs.squeeze()
             selected_pts_mask_abs = torch.where(padded_grad_abs >= grad_abs_threshold, True, False)
             selected_pts_mask = torch.logical_or(selected_pts_mask, selected_pts_mask_abs)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
 
+        if budget_headroom is not None:          # B8: rank the padded abs-grad score
+            _score = padded_grad_abs if use_abs_grad else padded_grad
+            selected_pts_mask = _trim_to_budget(selected_pts_mask, _score, budget_headroom)
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
-        means =torch.zeros((stds.size(0), 3),device="cuda")
+        means =torch.zeros((stds.size(0), 3),device=self._xyz.device)
         samples = torch.normal(mean=means, std=stds)
         rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
@@ -1815,9 +2139,11 @@ class GaussianModel:
         else:
             new_gaussian_features = None
         
+        parent_idx = torch.arange(self._xyz.shape[0], device=self._xyz.device)[selected_pts_mask].repeat(N)
         self.densification_postfix(
             new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, 
-            new_base_occupancy, new_occupancy_shift, new_gaussian_features
+            new_base_occupancy, new_occupancy_shift, new_gaussian_features,
+            parent_idx=parent_idx,
         )
         
         new_culling = self._culling[selected_pts_mask].repeat(N,1)
@@ -1825,16 +2151,20 @@ class GaussianModel:
         new_factor_culling = self.factor_culling[selected_pts_mask].repeat(N,1)
         self.factor_culling = torch.cat((self.factor_culling, new_factor_culling))      
 
-        prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
+        prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device=self._xyz.device, dtype=bool)))
         self.prune_points(prune_filter)
         
     def densify_and_clone_radegs(
         self, grads, grad_threshold,  
         grads_abs, grad_abs_threshold, scene_extent,
         use_abs_grad:bool=True,
+        budget_headroom=None,
     ):
         assert self.use_radegs_densification
         
+        # Confidence-based thresholds
+        grad_threshold = self.get_confidence_scaled_threshold(grad_threshold)
+        grad_abs_threshold = self.get_confidence_scaled_threshold(grad_abs_threshold)
         # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         if use_abs_grad:
@@ -1843,10 +2173,13 @@ class GaussianModel:
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
         
+        if budget_headroom is not None:          # B8
+            _score = torch.norm(grads_abs if use_abs_grad else grads, dim=-1)
+            selected_pts_mask = _trim_to_budget(selected_pts_mask, _score, budget_headroom)
         new_xyz = self._xyz[selected_pts_mask]
         # sample a new gaussian instead of fixing position
         stds = self.get_scaling[selected_pts_mask]
-        means =torch.zeros((stds.size(0), 3),device="cuda")
+        means =torch.zeros((stds.size(0), 3),device=self._xyz.device)
         samples = torch.normal(mean=means, std=stds)
         rots = build_rotation(self._rotation[selected_pts_mask])
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask]
@@ -1870,9 +2203,11 @@ class GaussianModel:
         else:
             new_gaussian_features = None
 
+        parent_idx = torch.arange(self._xyz.shape[0], device=self._xyz.device)[selected_pts_mask]
         self.densification_postfix(
             new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, 
-            new_base_occupancy, new_occupancy_shift, new_gaussian_features
+            new_base_occupancy, new_occupancy_shift, new_gaussian_features,
+            parent_idx=parent_idx,
         )
 
         new_culling = self._culling[selected_pts_mask]
@@ -1885,6 +2220,7 @@ class GaussianModel:
         self, max_grad, min_opacity, extent, max_screen_size,
         use_abs_grad:bool=True,
         viewpoint_cameras: List=None,
+        budget=None,
     ):
         assert self.use_radegs_densification
         
@@ -1897,10 +2233,15 @@ class GaussianModel:
         Q = torch.quantile(grads_abs.reshape(-1), 1 - ratio)
         
         before = self._xyz.shape[0]
-        self.densify_and_clone_radegs(grads, max_grad, grads_abs, Q, extent, use_abs_grad=use_abs_grad)
+        headroom = None if budget is None else max(budget - before, 0)
+        self.densify_and_clone_radegs(grads, max_grad, grads_abs, Q, extent, use_abs_grad=use_abs_grad,
+                                      budget_headroom=headroom)
         clone = self._xyz.shape[0]
 
-        self.densify_and_split_radegs(grads, max_grad, grads_abs, Q, extent, use_abs_grad=use_abs_grad)
+        # Recompute headroom: the clone pass has already spent part of it (B8).
+        headroom = None if budget is None else max(budget - clone, 0)
+        self.densify_and_split_radegs(grads, max_grad, grads_abs, Q, extent, use_abs_grad=use_abs_grad,
+                                      budget_headroom=headroom)
         split = self._xyz.shape[0]
 
         if self.use_unbounded_opacity:

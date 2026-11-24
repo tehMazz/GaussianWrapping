@@ -35,7 +35,8 @@ def loadCam(args, id, cam_info, resolution_scale):
             else:
                 global_down = 1
         else:
-            global_down = orig_w / args.resolution
+            # -r <width> is a CAP: never upscale a view that is already narrower than the target.
+            global_down = max(1.0, orig_w / args.resolution)
 
         scale = float(global_down) * float(resolution_scale)
         resolution = (int(orig_w / scale), int(orig_h / scale))

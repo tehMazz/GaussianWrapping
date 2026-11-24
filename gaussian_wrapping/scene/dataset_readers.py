@@ -22,6 +22,7 @@ from pathlib import Path
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
+from beags.splits import split_cameras
 
 class CameraInfo(NamedTuple):
     uid: int
@@ -82,11 +83,11 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         R = np.transpose(qvec2rotmat(extr.qvec))
         T = np.array(extr.tvec)
 
-        if intr.model=="SIMPLE_PINHOLE":
+        if intr.model in ["SIMPLE_PINHOLE", "SIMPLE_RADIAL", "RADIAL"]:  # params: f, cx, cy[, k...]
             focal_length_x = intr.params[0]
             FovY = focal2fov(focal_length_x, height)
             FovX = focal2fov(focal_length_x, width)
-        elif intr.model=="PINHOLE":
+        elif intr.model in ["PINHOLE", "OPENCV", "OPENCV_FISHEYE", "FULL_OPENCV"]:  # OPENCV*: assumed undistorted
             focal_length_x = intr.params[0]
             focal_length_y = intr.params[1]
             FovY = focal2fov(focal_length_y, height)
@@ -149,12 +150,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
             cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir))
             cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
-            if eval:
-                train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
-                test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
-            else:
-                train_cam_infos = cam_infos
-                test_cam_infos = []
+            train_cam_infos, test_cam_infos = split_cameras(cam_infos, path, eval, llffhold)
 
             nerf_normalization = getNerfppNorm(train_cam_infos)
 

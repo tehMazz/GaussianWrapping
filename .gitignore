@@ -22,6 +22,10 @@ train_test_depth.py
 log/
 logs/
 logs
+# SLURM --output=logs/%x_%j.out needs the root logs/ to exist
+!/logs/
+/logs/*
+!/logs/.gitkeep
 profiler_test.py
 
 #####################
@@ -229,3 +233,12 @@ deprecated/
 datasets
 benchmark_clean_code
 nvdiffrast
+
+# BEA-GS deliverables (*.sh and *.md are ignored above)
+!slurm/*.sh
+!scripts/bakerh/*.sh
+!GWBEAGS.md
+!HANDOFF.md
+!HANDOFF_BAKERH.md
+!CLAUDE.md
+!scripts/bakerh/stages/*.sh
