@@ -1,0 +1,11 @@
+# Mono prior, normals only (regularization/regularizer/mono_prior.py). Weights ramp linearly from *_from to *_full.
+gate: auto                 # auto = on only if COLMAP median triangulation angle < max_tri_angle_deg; on | off
+max_tri_angle_deg: 5.0
+normal_weight: 0.05        # same size as GW's own lambda_depth_normal
+normal_from_iter: 500
+normal_full_iter: 1500
+normal_until_iter: -1      # -1 = until the end
+depth_weight: 0.0
+depth_from_iter: 0
+depth_full_iter: 0
+depth_until_iter: 0

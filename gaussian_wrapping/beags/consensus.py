@@ -3,6 +3,9 @@
 For every view, the masks of all views are warped into it through the rendered depth.
 A warp is kept only where the forward/backward reprojection agrees; the new mask is the
 average of the kept warps, per channel, over views where that channel is present.
+Where no warp is kept (no view, not even the target itself, passes the check, e.g. rendered depth 0),
+fallback="own" keeps the target's own input mask; "zero" writes 0 there (the old behaviour, which
+labelled about 32% of the spinnerf_7 object as background and drove the finetune's SAG erosion).
 """
 import torch
 import torch.nn.functional as F
@@ -43,7 +46,7 @@ def _to_grid(uv, H, W):
 
 
 @torch.no_grad()
-def iter_reproject_masks(cameras, depths, masks, present, threshold=0.01, chunk=4):
+def iter_reproject_masks(cameras, depths, masks, present, threshold=0.01, chunk=4, fallback="own"):
     """Consensus masks.
 
     Depths and masks may remain on CPU; only one target view and a small reference
@@ -84,14 +87,21 @@ def iter_reproject_masks(cameras, depths, masks, present, threshold=0.01, chunk=
             warped = F.grid_sample(torch.stack(warped_masks), fwd, mode="nearest", align_corners=False)
             votes += (warped * valid[:, None]).sum(0)
             count += (valid[:, None] & present[s:s + len(refs), :, None, None]).sum(0)
-        yield torch.where(count > 0, votes / count.clamp_min(1), torch.zeros_like(votes)).cpu()
+        own = masks[i]
+        if fallback == "own" and own is not None:
+            empty = own.to(device="cuda", dtype=torch.float32)
+        elif fallback in ("own", "zero"):
+            empty = torch.zeros_like(votes)
+        else:
+            raise ValueError(f"fallback must be 'own' or 'zero', got {fallback!r}")
+        yield torch.where(count > 0, votes / count.clamp_min(1), empty).cpu()
 
 
 @torch.no_grad()
-def reproject_masks(cameras, depths, masks, present, threshold=0.01, chunk=4):
+def reproject_masks(cameras, depths, masks, present, threshold=0.01, chunk=4, fallback="own"):
     """Compatibility wrapper returning all consensus masks as a CPU tensor."""
     if isinstance(masks, torch.Tensor):
         mask_views = list(masks.unbind(0))
     else:
         mask_views = masks
-    return torch.stack(list(iter_reproject_masks(cameras, depths, mask_views, present, threshold, chunk)))
+    return torch.stack(list(iter_reproject_masks(cameras, depths, mask_views, present, threshold, chunk, fallback)))

@@ -53,7 +53,8 @@ def loadCam(args, id, cam_info, resolution_scale):
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
                   image=gt_image, gt_alpha_mask=loaded_mask,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device)
+                  image_name=cam_info.image_name, uid=id, data_device=args.data_device,
+                  zfar=getattr(args, "camera_zfar", None) or 100.0)
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []
@@ -130,7 +131,8 @@ def resize_cameras(
             gt_alpha_mask=cam.gt_mask,
             image_name=cam.image_name, 
             uid=cam.uid,
-            data_device=cam.data_device
+            data_device=cam.data_device,
+            zfar=cam.zfar,
         )
         resized_cameras.append(resized_cam)
     

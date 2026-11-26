@@ -47,6 +47,7 @@ from regularization.regularizer.normal_field import (
     densify_normal_field,
     prune_non_maximal_gaussians,
 )
+from regularization.regularizer.mono_prior import MonoPrior
 from regularization.regularizer.depth_order import (
     initialize_depth_order_supervision,
     compute_depth_order_regularization,
@@ -293,6 +294,9 @@ def training(
             device='cuda',
         )
     ema_depth_order_loss_for_log = 0.0
+
+    # ---Monocular depth/normal prior (MoGe-2), only for weakly conditioned scenes (see mono_prior.py)---
+    mono_prior = MonoPrior.from_args(args, scene)
         
     # ---Log optimizable param groups---
     print(f"[INFO] Found {len(gaussians.optimizer.param_groups)} optimizable param groups:")
@@ -371,8 +375,10 @@ def training(
             depth_order_kick_on = depth_order_kick_on and (iteration < depth_order_config["deactivate_depth_order_after"])
         multiview_kick_on = args.multiview and (iteration >= multiview_config["start_multiview"])
         milo_kick_on = args.milo and (iteration >= milo_config["start_iter"])
+        mono_kick_on = mono_prior is not None and mono_prior.active(iteration)
         
         render_depth_in_forward_pass = (
+            mono_kick_on or
             reg_kick_on 
             or normal_field_kick_on 
             or depth_order_kick_on
@@ -535,6 +541,13 @@ def training(
                 
             loss = loss + depth_prior_loss
             depth_order_kick_on = lambda_depth_order > 0
+
+        # Monocular prior (normals / depth from MoGe-2)
+        if mono_kick_on:
+            mono_loss, mono_terms = mono_prior.loss(viewpoint_cam, render_pkg, iteration)
+            loss = loss + mono_loss
+            if iteration % 1000 == 0 and mono_terms:
+                print(f"[mono] it {iteration} weights {mono_prior.weights(iteration)} terms {mono_terms}")
             
         # Multiview Regularization
         if multiview_kick_on:
@@ -1032,6 +1045,11 @@ if __name__ == "__main__":
     # > In the paper, MILo does not rely on any learned prior.
     parser.add_argument("--depth_order", action="store_true")
     parser.add_argument("--depth_order_config", type=str, default="default")
+    # ----- Monocular prior (MoGe-2 depth + normals, mono_prior_prepare.py) for weakly conditioned scenes -----
+    parser.add_argument("--mono_prior_dir", type=str, default=None)
+    parser.add_argument("--mono_prior_config", type=str, default="normal")
+    parser.add_argument("--mono_prior_gate", type=str, default=None, choices=["auto", "on", "off"],
+                        help="overrides the config's gate")
 
     # ----- 3D Mip Filter -----
     # > Inspired by Mip-Splatting.

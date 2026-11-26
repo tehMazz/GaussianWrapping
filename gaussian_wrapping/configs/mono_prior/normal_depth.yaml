@@ -1,0 +1,11 @@
+# Mono prior, normals + depth. Depth only early (coarse layout), then the multi-view terms take over.
+gate: auto
+max_tri_angle_deg: 5.0
+normal_weight: 0.05
+normal_from_iter: 500
+normal_full_iter: 1500
+normal_until_iter: -1
+depth_weight: 0.2          # on relative depth error (MoGe vs COLMAP points: ~1.5 % median)
+depth_from_iter: 500
+depth_full_iter: 1500
+depth_until_iter: 15000

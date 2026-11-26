@@ -18,7 +18,7 @@ from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
                  image_name, uid,
-                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda"
+                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda", zfar=100.0
                  ):
         super(Camera, self).__init__()
 
@@ -48,7 +48,10 @@ class Camera(nn.Module):
             # self.original_image *= torch.ones((1, self.image_height, self.image_width), device=self.data_device)
             self.gt_mask = None
 
-        self.zfar = 100.0
+        # zfar: 100 is the 3DGS default. Gaussian rasterization ignores it, but GW also uses camera.zfar as a depth cut
+        # (normal-field pivots, PAM, mesh colours / MILo through is_in_view_frustum, nvdiffrast clipping), which drops
+        # whole forward-facing scenes (SPIn-NeRF 7: everything at 115-130 units). Set it with --camera_zfar.
+        self.zfar = float(zfar)
         self.znear = 0.01
 
         self.trans = trans

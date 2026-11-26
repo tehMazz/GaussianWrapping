@@ -7,7 +7,9 @@ export PATH=$ENV/bin:$PATH                             # ninja for torch JIT ext
 export TORCH_CUDA_ARCH_LIST=8.0 OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8} PYTHONPATH=
 # gs-atoms (ViewAdam, EpochPrune, decay_opacity_, host_state): pure PyTorch, imported as `atoms`.
 GSATOMS=${GSATOMS:-/leonardo_work/IscrC_EditGS/repos/CVPR2027/gs-atoms}
-export PYTHONPATH=$GSATOMS
+# RASTER_PATH (opt-in): dir of a test build of diff_gaussian_rasterization_ours_beags (built in place); it goes first on
+# PYTHONPATH so render_ours loads it instead of the installed build. Unset = the installed build.
+export PYTHONPATH=${RASTER_PATH:+$RASTER_PATH:}$GSATOMS
 ROOT=$(pwd)
 METHOD=${METHOD:-gw_beags}                             # output/<METHOD>/<name>/<mode>
 ITER=${ITER:-30000}                                    # GW training iterations

@@ -272,6 +272,26 @@ def test_consensus_of_single_view_is_identity():
 
 
 @needs_cuda
+def test_consensus_without_valid_view_keeps_own_mask():
+    """Depth holes (rendered depth 0) fail the check in every view, the target included: the default keeps the
+    view's own mask there; fallback="zero" (the old behaviour) turns the object into background."""
+    from beags.consensus import reproject_masks
+    cam = _camera()
+    H, W = cam.image_height, cam.image_width
+    depth = torch.full((1, H, W), 3.0, device="cuda")
+    depth[0, 25:45, 40:80] = 0                                     # hole inside the object
+    masks = torch.zeros(1, 2, H, W, device="cuda")
+    masks[0, 1, 20:50, 30:90] = 1
+    masks[0, 0] = 1 - masks[0, 1]
+    present = torch.ones(1, 2, dtype=torch.bool)
+    own = reproject_masks([cam], depth, masks, present)
+    torch.testing.assert_close(own[..., 1:-1, 1:-1], masks.cpu()[..., 1:-1, 1:-1])
+    zero = reproject_masks([cam], depth, masks, present, fallback="zero")
+    assert float(zero[0, :, 25:45, 40:80].abs().sum()) == 0.0
+    torch.testing.assert_close(zero[0, 1, 20:25, 30:90], masks.cpu()[0, 1, 20:25, 30:90])
+
+
+@needs_cuda
 def test_assign_labels_never_hit_gets_minus_one():
     pytest.importorskip("diff_gaussian_rasterization_ours_beags")
     from beags.labels import assign_labels

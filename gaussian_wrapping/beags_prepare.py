@@ -29,17 +29,21 @@ from gaussian_renderer.beags_api import render_depth_alpha
 def add_args(parser):
     parser.add_argument("--masks", required=True, help="dir with <image_name>.npy (C, H, W) masks")
     parser.add_argument("--reprojection_threshold", type=float, default=0.01)
+    parser.add_argument("--consensus_fallback", choices=["own", "zero"], default="own",
+                        help="pixels no view validates: keep the view's own mask (own) or call them background "
+                             "(zero, the behaviour before 2026-11-25)")
 
 
 @torch.no_grad()
-def consensus_masks(cameras, gaussians, pipe, num_labels, threshold):
+def consensus_masks(cameras, gaussians, pipe, num_labels, threshold, fallback="own"):
     depths = [render_depth_alpha(c, gaussians, pipe)[0].detach().cpu() for c in cameras]
     H = min(depth.shape[0] for depth in depths)
     W = min(depth.shape[1] for depth in depths)
     depths = [depth[:H, :W].contiguous() for depth in depths]
     masks = [None if c.masks.soft is None else c.masks.soft[:, :H, :W].contiguous() for c in cameras]
     present = torch.stack([c.masks.present for c in cameras])
-    for camera, soft in zip(cameras, iter_reproject_masks(cameras, depths, masks, present, threshold)):
+    for camera, soft in zip(cameras, iter_reproject_masks(cameras, depths, masks, present, threshold,
+                                                                    fallback=fallback)):
         if soft.shape[-2:] != (camera.image_height, camera.image_width):
             soft = F.interpolate(soft[None], size=(camera.image_height, camera.image_width),
                                  mode="bilinear", align_corners=False)[0]
@@ -55,7 +59,8 @@ def main():
     print("[beags] mask consensus")
     out_dir = beags_path(dataset.model_path, "masks")
     os.makedirs(out_dir, exist_ok=True)
-    for cam, soft in zip(cameras, consensus_masks(cameras, gaussians, pipe, num_labels, args.reprojection_threshold)):
+    for cam, soft in zip(cameras, consensus_masks(cameras, gaussians, pipe, num_labels, args.reprojection_threshold,
+                                                         args.consensus_fallback)):
         np.save(os.path.join(out_dir, f"{cam.image_name}.npy"), soft.half().numpy())
         cam.masks = make_view_masks(soft, cam.image_height, cam.image_width, num_labels, 1.0)
 

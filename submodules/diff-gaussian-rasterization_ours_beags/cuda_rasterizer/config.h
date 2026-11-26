@@ -32,6 +32,7 @@ constexpr float MIN_TRANSMITTANCE = 0.45f;
 constexpr float TDELTA_NEGATIVE_GRAD_MUL = 1.0f;
 constexpr float TDELTA_POSITIVE_GRAD_MUL = 0.001f;
 constexpr int SPLIT               = 8;
+constexpr int FULL_BRACKET_MAX_EXTRA = 6;  // full-bracket fallback: at most 8^6 x the stock window
 #if TRAINING
 constexpr float SAMPLE_RANGE   = 0.4f;
 // constexpr float SAMPLE_RANGE   = 0.8f;

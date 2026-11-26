@@ -458,6 +458,7 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
     [[maybe_unused]] float last_depth  = 0;
     [[maybe_unused]] float last_weight = 0;
     [[maybe_unused]] float mDepthinit  = 0;
+    [[maybe_unused]] float t_up        = 0;
 #ifdef MOST_VISIBLE_INIT
     [[maybe_unused]] float max_weight = 0;
 #endif
@@ -540,6 +541,7 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
                 Normal[0] += normal.x * aT;
                 Normal[1] += normal.y * aT;
                 Normal[2] += normal.z * aT;
+                t_up = T > 0.5f ? fmaxf(t_up, t) : t_up;  // full-bracket fallback, any init mode
 #if defined(MEDIAN_DEPTH_INIT)
                 mDepthinit = T > 0.5f ? t : mDepthinit;
 #elif defined(MEAN_DEPTH_INIT)
@@ -589,19 +591,23 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
         float depth_min = fmaxf(mDepthinit - SAMPLE_RANGE, 0.f);
         float depth_max = fmaxf(mDepthinit + SAMPLE_RANGE, 0.f);
         bool in_range   = T <= MIN_TRANSMITTANCE;
+        const bool opaque = in_range;  // the ray reaches T <= MIN_TRANSMITTANCE: a T = 0.5 crossing exists
+        bool active       = true;      // full-bracket fallback: an inactive thread keeps its window through iter()
 
         auto iter = [&] __device__(auto first_const) {
             constexpr bool FIRST           = decltype(first_const)::value;
             constexpr float ONE_OVER_SPLIT = 1.f / static_cast<float>(SPLIT);
             constexpr int START_ID         = FIRST ? 0 : 1;
             constexpr int END_ID           = FIRST ? SPLIT + 1 : SPLIT;
+            if (active) {
 #pragma unroll
-            for (int i = START_ID; i < END_ID; i++) {
-                T_p[i] = 1.f;
+                for (int i = START_ID; i < END_ID; i++) {
+                    T_p[i] = 1.f;
+                }
             }
             float interval = (depth_max - depth_min) * ONE_OVER_SPLIT;
             // bool done      = !in_range || (last_contributor == 0) || !inside;
-            bool done   = !in_range;
+            bool done   = !in_range || !active;
             int toDo    = max_contributor;
             contributor = 0;
             // Iterate over batches until all done or range is complete
@@ -647,6 +653,8 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
                     }
                 }
             }
+            if (!active)
+                return;
             if constexpr (FIRST) {
                 in_range = (T_p[0] >= 0.5f) && (T_p[SPLIT] <= 0.5f) && in_range;
             }
@@ -664,6 +672,40 @@ __global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
         iter(std::true_type{});
         for (int i = 0; i < SPLIT_ITERATIONS - 1; i++)
             iter(std::false_type{});
+
+        // FULL BRACKET fallback (BEA-GS_GWrap 2026-11-26). The stock search looks only inside mDepthinit +- SAMPLE_RANGE
+        // and returns 0 when the T = 0.5 crossing lies outside (far scenes, layered Gaussians). For those pixels only, search
+        // again over [0, t_up]: t_up = farthest t_peak among the Gaussians blended while T > 0.5, so T(t_up) <= 0.5 <= T(0)
+        // and the crossing is inside. fb_extra more splits keep the final bin no wider than the stock one. Pixels the stock
+        // search resolved are untouched (bit-identical to stock); the block votes, so blocks without such pixels pay nothing.
+        {
+            __shared__ int s_fb_extra;
+            if (block.thread_rank() == 0)
+                s_fb_extra = -1;
+            block.sync();
+            const bool missed  = opaque && !in_range;
+            const float fb_max = fmaxf(fmaxf(t_up, mDepthinit), 0.f) * 1.0001f + 1e-6f;
+            if (missed) {
+                int e = 0;
+                for (float w = 2.f * SAMPLE_RANGE; w < fb_max && e < FULL_BRACKET_MAX_EXTRA; w *= SPLIT)
+                    e++;
+                atomicMax(&s_fb_extra, e);
+            }
+            block.sync();
+            const int fb_extra = s_fb_extra;  // block-uniform: every thread runs the same number of iter() calls
+            if (fb_extra >= 0) {
+                active = missed;
+                if (missed) {
+                    depth_min = 0.f;
+                    depth_max = fb_max;
+                    in_range  = true;
+                }
+                iter(std::true_type{});
+                for (int i = 0; i < SPLIT_ITERATIONS - 1 + fb_extra; i++)
+                    iter(std::false_type{});
+                active = true;
+            }
+        }
 
         float w_max = __saturatef((T_p[0] - 0.5f) / (T_p[0] - T_p[SPLIT]));
         float w_min = 1.f - w_max;

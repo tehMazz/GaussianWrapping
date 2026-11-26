@@ -26,6 +26,7 @@ import torch
 from fused_ssim import fused_ssim
 from tqdm import tqdm
 
+from beags import ft_probe
 from beags.common import beags_path, load_model, parse_args
 from beags.labels import labeled_point_cloud
 from beags.masks import attach_masks
@@ -69,6 +70,7 @@ def add_args(parser):
     parser.add_argument("--dilation_weight", type=float, default=1.0)
     parser.add_argument("--prune_opacity", type=float, default=0.05)
     parser.add_argument("--prune_interval", type=int, default=100)
+    ft_probe.add_args(parser)
     if "--hollow" in sys.argv:
         from hollow.schedule import HollowSchedule
         HollowSchedule.add_args(parser)  # --hollow + its hollow_* args
@@ -132,6 +134,10 @@ def finetune(dataset, pipe, opt, args):
         args.iterations = start + args.ft_iterations
         hollow = HollowSchedule(args, scene, gaussians, pipe)
 
+    probe = ft_probe.FinetuneProbe(args, scene) if args.snap_every > 0 else None
+    if probe is not None:
+        probe.snapshot(0, gaussians, pipe)
+
     stack = []
     progress = tqdm(range(1, args.ft_iterations + 1), desc="BEA-GS finetune")
     for it in progress:
@@ -157,6 +163,7 @@ def finetune(dataset, pipe, opt, args):
         piv = pivot_loss(gaussians, labels if occ_background else torch.where(labels == 0, -1, labels),
                          voxels, args.pivot_max_ring, args.max_gaussians) if args.lambda_piv > 0 else occ * 0
         loss = photo + args.lambda_sag * sag + args.lambda_occ * occ + args.lambda_piv * piv
+        alpha_obj = None
         # ---B10: the extracted object must render opaque inside its mask and empty outside---
         # occ (weight 10) and sag both push object opacity DOWN; measured on spinnerf_7 this erodes
         # label 1 from 17740 Gaussians at mean opacity 0.992 to 11748 at 0.743 over 3000 iterations.
@@ -171,11 +178,19 @@ def finetune(dataset, pipe, opt, args):
                         continue
                     obj = render_labels(cam, gaussians, pipe, bg, mask=sel)
                     target = (pixel_labels == k).float()
-                    loss = loss + args.lambda_alpha_obj * (
-                        valid * (obj["alpha"][0] - target).abs()).sum() / valid.sum()
+                    term = args.lambda_alpha_obj * (valid * (obj["alpha"][0] - target).abs()).sum() / valid.sum()
+                    alpha_obj = term if alpha_obj is None else alpha_obj + term
+                    loss = loss + term
                     obj_radii = obj["radii"]
         if hollow is not None:
             loss = loss + hollow.loss(start + it)
+        snap = probe is not None and probe.due(it, args.ft_iterations)
+        if snap:  # weighted terms, measured on this step's graph before backward
+            terms = {"photo": photo, "sag": args.lambda_sag * sag, "occ": args.lambda_occ * occ,
+                     "piv": args.lambda_piv * piv}
+            if alpha_obj is not None:
+                terms["alpha_obj"] = alpha_obj
+            push = ft_probe.term_push(terms, gaussians, args.snap_label)
         loss.backward()
 
         with torch.no_grad():
@@ -195,6 +210,8 @@ def finetune(dataset, pipe, opt, args):
                 gaussians.prune_points((gaussians.get_opacity < args.prune_opacity).squeeze(1))
             if hollow is not None:
                 hollow.after_step(start + it)
+            if snap:
+                probe.snapshot(it, gaussians, pipe, terms={k: v.item() for k, v in terms.items()}, push=push)
             if it % 10 == 0:
                 progress.set_postfix(photo=f"{photo.item():.4f}", sag=f"{sag.item():.5f}", occ=f"{occ.item():.5f}",
                                      piv=f"{piv.item():.4f}", n=gaussians.get_xyz.shape[0])

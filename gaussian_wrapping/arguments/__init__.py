@@ -54,6 +54,7 @@ class ModelParams(ParamGroup):
         self._white_background = False
         self.data_device = "cpu"  # images stay on the CPU (BakerH: up to 923 photos at 1600 px)
         self.eval = False
+        self.camera_zfar = 100.0  # far plane of every Camera (3DGS default 100; forward-facing scenes need ~1e4)
         # self.use_decoupled_appearance = False
         self.llff = 8
         self.kernel_size = 0.0  # Added

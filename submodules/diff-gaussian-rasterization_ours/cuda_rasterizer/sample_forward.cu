@@ -204,6 +204,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
 
     bool done[SAMPLES_PRE_ROUND]   = {false};
     float Depth[SAMPLES_PRE_ROUND] = {0.f};
+    float Tup[SAMPLES_PRE_ROUND]   = {0.f};
 #ifdef MOST_VISIBLE_INIT
     float max_weight[SAMPLES_PRE_ROUND] = {0.f};
 #endif
@@ -268,6 +269,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
                     continue;
                 }
                 float t = ray_plane.x * d.x + ray_plane.y * d.y + ray_plane.z;
+                Tup[p] = T[p] > 0.5f ? fmaxf(Tup[p], t) : Tup[p];  // full-bracket fallback, any init mode
 #if defined(MEDIAN_DEPTH_INIT)
                 Depth[p] = T[p] > 0.5f ? t : Depth[p];
 #elif defined(MEAN_DEPTH_INIT)
@@ -309,6 +311,8 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
 
     float depth_min[SAMPLES_PRE_ROUND];
     float depth_max[SAMPLES_PRE_ROUND];
+    float fb_max[SAMPLES_PRE_ROUND];                     // full-bracket fallback window end, per point
+    const float fb_stock_width = 4.f * SAMPLE_RANGE;   // width of the stock window below
     for (int p = 0; p < point_num_round; p++) {
 #if defined(MEAN_DEPTH_INIT)
         float mDepthinit = Depth[p] / (1.f - T[p]);
@@ -317,11 +321,16 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
 #endif
         depth_min[p] = fmaxf(mDepthinit - SAMPLE_RANGE * 2.f, 0.f);
         depth_max[p] = fmaxf(mDepthinit + SAMPLE_RANGE * 2.f, 0.f);
+        fb_max[p]    = fmaxf(fmaxf(Tup[p], mDepthinit), 0.f) * 1.0001f + 1e-6f;
     }
     float T_p[SAMPLES_PRE_ROUND][SPLIT + 1];
     bool inside_range[SAMPLES_PRE_ROUND] = {false};
+    bool opaque[SAMPLES_PRE_ROUND]       = {false};  // a T = 0.5 crossing exists
+    bool active[SAMPLES_PRE_ROUND]       = {false};  // full-bracket fallback: an inactive point keeps its window
     for (int p = 0; p < point_num_round; p++) {
         inside_range[p] = T[p] <= MIN_TRANSMITTANCE;
+        opaque[p]       = inside_range[p];
+        active[p]       = true;
     }
 
     auto iter = [&] __device__(auto first_const) {
@@ -335,8 +344,10 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
         constexpr int START_ID         = FIRST ? 0 : 1;
         constexpr int END_ID           = FIRST ? SPLIT + 1 : SPLIT;
         for (int p = 0; p < point_num_round; p++) {
-            done[p] = !(inside_range[p]);
+            done[p] = !(inside_range[p]) || !active[p];
             point_done += static_cast<int>(done[p]);
+            if (!active[p])
+                continue;
             interval[p] = (depth_max[p] - depth_min[p]) * ONE_OVER_SPLIT;
 #pragma unroll
             for (int s = START_ID; s < END_ID; s++) {
@@ -396,6 +407,8 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
             }
         }
         for (int p = 0; p < point_num_round; p++) {
+            if (!active[p])
+                continue;
             if constexpr (FIRST) {
                 inside_range[p] = (T_p[p][0] >= 0.5f) && (T_p[p][SPLIT] <= 0.5f) && inside_range[p];
             }
@@ -414,6 +427,46 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
     iter(std::true_type{});
     for (int i = 0; i < SPLIT_ITERATIONS - 1; i++)
         iter(std::false_type{});
+
+    // FULL BRACKET fallback (BEA-GS_GWrap 2026-11-26). The stock search looks only inside mDepthinit +- SAMPLE_RANGE
+    // and returns 0 when the T = 0.5 crossing lies outside (far scenes, layered Gaussians). For those pixels only, search
+    // again over [0, t_up]: t_up = farthest t_peak among the Gaussians blended while T > 0.5, so T(t_up) <= 0.5 <= T(0)
+    // and the crossing is inside. fb_extra more splits keep the final bin no wider than the stock one. Pixels the stock
+    // search resolved are untouched (bit-identical to stock); the block votes, so blocks without such pixels pay nothing.
+    {
+        __shared__ int s_fb_extra;
+        if (block.thread_rank() == 0)
+            s_fb_extra = -1;
+        block.sync();
+        bool missed[SAMPLES_PRE_ROUND] = {false};
+        int e_thread                   = -1;
+        for (int p = 0; p < point_num_round; p++) {
+            missed[p] = opaque[p] && !inside_range[p];
+            if (missed[p]) {
+                int e = 0;
+                for (float w = fb_stock_width; w < fb_max[p] && e < FULL_BRACKET_MAX_EXTRA; w *= SPLIT)
+                    e++;
+                e_thread = max(e_thread, e);
+            }
+        }
+        if (e_thread >= 0)
+            atomicMax(&s_fb_extra, e_thread);
+        block.sync();
+        const int fb_extra = s_fb_extra;  // block-uniform: every thread runs the same number of iter() calls
+        if (fb_extra >= 0) {
+            for (int p = 0; p < point_num_round; p++) {
+                active[p] = missed[p];
+                if (missed[p]) {
+                    depth_min[p]    = 0.f;
+                    depth_max[p]    = fb_max[p];
+                    inside_range[p] = true;
+                }
+            }
+            iter(std::true_type{});
+            for (int i = 0; i < (int)SPLIT_ITERATIONS - 1 + fb_extra; i++)
+                iter(std::false_type{});
+        }
+    }
 
     for (int p = 0; p < point_num_round; p++) {
         float w_max                 = __saturatef((T_p[p][0] - 0.5f) / (T_p[p][0] - T_p[p][SPLIT]));
@@ -463,6 +516,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
 
     bool done[SAMPLES_PRE_ROUND]   = {false};
     float Depth[SAMPLES_PRE_ROUND] = {0.f};
+    float Tup[SAMPLES_PRE_ROUND]   = {0.f};
 #ifdef MOST_VISIBLE_INIT
     float max_weight[SAMPLES_PRE_ROUND] = {0.f};
 #endif
@@ -531,6 +585,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
                     continue;
                 }
                 float t = ray_plane.x * d.x + ray_plane.y * d.y + ray_plane.z;
+                Tup[p] = T[p] > 0.5f ? fmaxf(Tup[p], t) : Tup[p];  // full-bracket fallback, any init mode
 #if defined(MEDIAN_DEPTH_INIT)
                 Depth[p] = T[p] > 0.5f ? t : Depth[p];
 #elif defined(MEAN_DEPTH_INIT)
@@ -572,6 +627,8 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
 
     float depth_min[SAMPLES_PRE_ROUND];
     float depth_max[SAMPLES_PRE_ROUND];
+    float fb_max[SAMPLES_PRE_ROUND];                     // full-bracket fallback window end, per point
+    const float fb_stock_width = 2.f * SAMPLE_RANGE;   // width of the stock window below
     for (int p = 0; p < point_num_round; p++) {
 #if defined(MEAN_DEPTH_INIT)
         float mDepthinit = Depth[p] / (1.f - T[p]);
@@ -580,11 +637,16 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
 #endif
         depth_min[p] = fmaxf(mDepthinit - SAMPLE_RANGE, 0.f);
         depth_max[p] = fmaxf(mDepthinit + SAMPLE_RANGE, 0.f);
+        fb_max[p]    = fmaxf(fmaxf(Tup[p], mDepthinit), 0.f) * 1.0001f + 1e-6f;
     }
     float T_p[SAMPLES_PRE_ROUND][SPLIT + 1];
     bool inside_range[SAMPLES_PRE_ROUND] = {false};
+    bool opaque[SAMPLES_PRE_ROUND]       = {false};  // a T = 0.5 crossing exists
+    bool active[SAMPLES_PRE_ROUND]       = {false};  // full-bracket fallback: an inactive point keeps its window
     for (int p = 0; p < point_num_round; p++) {
         inside_range[p] = T[p] <= MIN_TRANSMITTANCE;
+        opaque[p]       = inside_range[p];
+        active[p]       = true;
     }
 
     auto iter = [&] __device__(auto first_const) {
@@ -598,8 +660,10 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
         constexpr int START_ID         = FIRST ? 0 : 1;
         constexpr int END_ID           = FIRST ? SPLIT + 1 : SPLIT;
         for (int p = 0; p < point_num_round; p++) {
-            done[p] = !(inside_range[p]);
+            done[p] = !(inside_range[p]) || !active[p];
             point_done += static_cast<int>(done[p]);
+            if (!active[p])
+                continue;
             interval[p] = (depth_max[p] - depth_min[p]) * ONE_OVER_SPLIT;
 #pragma unroll
             for (int s = START_ID; s < END_ID; s++) {
@@ -660,6 +724,8 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
             }
         }
         for (int p = 0; p < point_num_round; p++) {
+            if (!active[p])
+                continue;
             if constexpr (FIRST) {
                 inside_range[p] = (T_p[p][0] >= 0.5f) && (T_p[p][SPLIT] <= 0.5f) && inside_range[p];
             }
@@ -678,6 +744,46 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
     iter(std::true_type{});
     for (int i = 0; i < SPLIT_ITERATIONS - 1; i++)
         iter(std::false_type{});
+
+    // FULL BRACKET fallback (BEA-GS_GWrap 2026-11-26). The stock search looks only inside mDepthinit +- SAMPLE_RANGE
+    // and returns 0 when the T = 0.5 crossing lies outside (far scenes, layered Gaussians). For those pixels only, search
+    // again over [0, t_up]: t_up = farthest t_peak among the Gaussians blended while T > 0.5, so T(t_up) <= 0.5 <= T(0)
+    // and the crossing is inside. fb_extra more splits keep the final bin no wider than the stock one. Pixels the stock
+    // search resolved are untouched (bit-identical to stock); the block votes, so blocks without such pixels pay nothing.
+    {
+        __shared__ int s_fb_extra;
+        if (block.thread_rank() == 0)
+            s_fb_extra = -1;
+        block.sync();
+        bool missed[SAMPLES_PRE_ROUND] = {false};
+        int e_thread                   = -1;
+        for (int p = 0; p < point_num_round; p++) {
+            missed[p] = opaque[p] && !inside_range[p];
+            if (missed[p]) {
+                int e = 0;
+                for (float w = fb_stock_width; w < fb_max[p] && e < FULL_BRACKET_MAX_EXTRA; w *= SPLIT)
+                    e++;
+                e_thread = max(e_thread, e);
+            }
+        }
+        if (e_thread >= 0)
+            atomicMax(&s_fb_extra, e_thread);
+        block.sync();
+        const int fb_extra = s_fb_extra;  // block-uniform: every thread runs the same number of iter() calls
+        if (fb_extra >= 0) {
+            for (int p = 0; p < point_num_round; p++) {
+                active[p] = missed[p];
+                if (missed[p]) {
+                    depth_min[p]    = 0.f;
+                    depth_max[p]    = fb_max[p];
+                    inside_range[p] = true;
+                }
+            }
+            iter(std::true_type{});
+            for (int i = 0; i < (int)SPLIT_ITERATIONS - 1 + fb_extra; i++)
+                iter(std::false_type{});
+        }
+    }
 
     for (int p = 0; p < point_num_round; p++) {
         float w_max                 = __saturatef((T_p[p][0] - 0.5f) / (T_p[p][0] - T_p[p][SPLIT]));
